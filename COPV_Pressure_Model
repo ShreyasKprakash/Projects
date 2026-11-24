@@ -1,0 +1,695 @@
+%% ========================================================================
+%  TACOMA LH2 TANK - PRESSURE, ORIFICE-FLOW & TEST-CAMPAIGN MODEL  (v6: OPEN VENT, NO RELIEF VALVES)
+%  ------------------------------------------------------------------------
+%  Shreyas Prakash Kota - LHT Hydrogen Aviation Lab / TU Darmstadt - 2026
+%
+%  Configuration (v5):
+%   - Boil-off line is ALWAYS OPEN to the Abgaskamin: 1" tube, Swagelok SS-1610
+%     fitting, DN40/DN80 vent header. No boil-off valve -> tank sits at ~1 atm,
+%     LH2 at ~20.3 K, boiling off continuously.
+%   - TACOMA as built: NO safety valves, NO burst disc. Only pressure transmitters
+%     (monitoring + alarm). The open vent is the ONLY relief path. Set has_SV = true
+%     to see what two safety valves at MEOP would change.
+%   - He purge as a flow-through (sweep) purge at ~1 atm; He leak test at 4 bar g
+%     with the vent fitting CAPPED (warm tank only).
+%   - Gas supply and vent per R&I 'Gasversorgung' (SVE, DN15 PN25, DN40/DN80 PN40).
+%
+%  STEPS / FIGURES
+%   1-2  Geometry, LH2 property table
+%   3    Pressure levels & burst                        -> Fig 1
+%   4    He purge + leak-test limits                    -> Fig 2
+%   5    LN2 / LH2 chilldown                            -> Fig 3
+%   6    LH2 capacity + fill height                     -> Fig 4
+%   7    Heat leak
+%   8    HYDROS check, open-vent boil-off, blocked vent -> Fig 5, Fig 9
+%   10   He leak-test pressurisation + blowdown         -> Fig 6
+%   11   Open vent capacity + safety valves             -> Fig 7
+%   12   Measured logger data (or DEMO) vs model        -> Fig 8
+%   13   Summary
+%  Pressures in Pa ABSOLUTE unless the name ends in _g (gauge).
+%  Lines marked  % <-- PLACEHOLDER / % <-- CHECK  need real values.
+%  MATLAB R2020b or newer (local functions at the end of the script).
+%% ========================================================================
+clear; close all; clc;
+
+%% 0) INPUTS ===============================================================
+% ---- Tank geometry (SolidWorks 22.11.2026) ----
+Ro       = 0.2032;     % outer radius inner vessel [m] (16" OD)
+L_cyl    = 0.7919;     % cylinder length between head tangent lines [m]
+t_wall   = 9.5e-3;     % wall thickness [m] (16" STD wall)
+head_k   = 0.5;        % head depth / Ri (0.5 = 2:1 ellipsoidal)             % <-- CHECK
+rho_ss   = 7950;       % density 316L [kg/m3]
+m_extra  = 20;         % flanges, sensor caps, internals that also get cold [kg] % <-- PLACEHOLDER
+
+% ---- Material 1.4404 / 316L, room temperature minimums (EN 10028-7) ----
+Rp02     = 220e6;      % yield [Pa]
+Rm       = 520e6;      % tensile [Pa]
+z_weld   = 1.0;        % weld joint efficiency EN 13445: 1.0 full NDT, 0.85 partial, 0.7 visual % <-- CHECK
+
+% ---- Pressure levels ----
+patm     = 1.01325e5;
+p_alarm_g = 0.5e5;     % alarm: tank pressure above this means the vent is BLOCKED [Pa g] % <-- CHECK
+p_leaktest_g = 4.0e5;  % He leak test pressure, warm tank, vent fitting capped [Pa g]
+MEOP_g   = 6.0e5;      % MEOP = 7 bar a = safety-valve set pressure [Pa g]
+has_SV   = false;      % TACOMA as built: no safety valves (true = study 2 valves at MEOP)
+n_SV     = 2;          % number of safety valves if has_SV = true
+PS_comp_g = 10e5;      % rating of weakest component (flange, feedthrough, sensor) [Pa g] % <-- PLACEHOLDER
+SF_req   = 4.0;        % required burst factor vs MEOP
+fill_max_at_relief = 0.95; % liquid <= 95 % of volume even at safety-valve relieving pressure
+fill_target    = 0.50; % planned fill: liquid volume fraction at 1 atm (NaN = fill to the safety limit)
+
+% ---- Phase A/C: He purge ----
+purge_mode   = 'sweep';% 'sweep' = He flows through the open tank at ~1 atm (vent open)
+p_purge_high = 4.0e5 + 1.01325e5;  % pressure-purge fill [Pa abs] (alternative, needs the vent capped)
+p_vent_low   = 1.1e5;  % pressure-purge low point [Pa abs]
+c_target_O2  = 100e-6; % target O2 before cryogens [mol/mol]               % <-- LHT procedure
+c_target_N2  = 1e-3;   % target N2 before LH2 (N2 freezes at 63 K)         % <-- LHT procedure
+
+% ---- Phase A: He pressure-hold leak test (vent capped) ----
+p_hold   = 4.0e5 + 1.01325e5;  % hold pressure [Pa abs] = 4 bar g
+t_hold   = 3600;       % hold time [s]
+dp_res   = 500;        % transmitter resolution/accuracy [Pa] (5 mbar)     % <-- JUMO datasheet
+dT_res   = 0.1;        % temperature uncertainty during hold [K]
+
+% ---- Heat leak ----
+T_room   = 293.15;
+use_MLI  = true;                                                           % <-- CHECK
+eps_in = 0.05;  eps_out = 0.10;  q_MLI = 1.0;  Q_cond = 2.0;               % <-- PLACEHOLDER (Q_cond)
+Q_leak_override = NaN; % set e.g. 1.4 [W] to force a heat leak (NaN = use estimate above)
+Q_sweep  = [0.5 1 1.4 2 3.4 5 10 22];  % heat leaks from 'near perfect' to 'no MLI' [W] (Fig 5, Fig 9)
+
+% ---- Gas supply from SVE container (R&I Gasversorgung) ----
+p_bundle    = 300e5;                 % bundle pressure [Pa g] (H2, N2, He)
+p_line_g.H2 = 18e5;                  % 2-III SFH2  DN15 PN25 [Pa g] (V-07)
+p_line_g.He = 18e5;                  % 4-III SFHe  DN15 PN25 [Pa g] (V-05)
+p_line_g.N2 = 10e5;                  % 6-III SFN2  DN15 PN25 [Pa g] (V-06)
+Q_reg.H2    = 627;                   % regulator V-07 max capacity [Nm3/h]
+Q_reg.He    = 446;                   % regulator V-05 max capacity [Nm3/h]
+Q_reg.N2    = 130;                   % regulator V-06 max capacity [Nm3/h]
+Q_line_max  = 120;                   % design flow of each DN15 supply line [Nm3/h]
+p_SiV_g     = 25e5;                  % line safety valves SiV-1/2/3 [Pa g] (protect the LINES)
+PN_line     = 25e5;  PN_vent = 40e5; % pressure ratings of supply / vent lines [Pa]
+ops_gas     = 'He';                  % gas for the leak-test pressurisation ('He' or 'N2')
+d_feed   = 2e-3;  Cd_feed = 0.80;    % smallest restriction on the tank gas panel % <-- PLACEHOLDER
+h_wall   = 0;                        % gas-wall heat transfer [W/m2K]; 0 = adiabatic worst case
+fail_use_restriction = false;        % regulator-failure case: false = ignore d_feed (conservative)
+
+% ---- Open boil-off line: 1" tube, Swagelok SS-1610 fitting -> vent header ----
+d_vent   = 22.1e-3;    % bore of the 1" tube [m] (1" OD x 0.065" wall)     % <-- CHECK tube wall
+Cd_vent  = 0.60;       % discharge coefficient of line entry + fittings    % <-- estimate
+VH.dp40 = 0.370e5;  VH.Q40 = 1860;   % DN40: 370 mbar at 1860 Nm3/h (R&I)
+VH.dp80 = 0.120e5;  VH.Q80 = 4650;   % DN80: 120 mbar at 4650 Nm3/h (R&I)
+VH.rho_ref = 0.0899;                 % reference gas density [kg/Nm3] (H2)  % <-- CHECK
+
+% ---- Safety valves & chimney ----
+d_SV     = 8e-3;   Kd_SV  = 0.80;    % each safety valve: flow diameter / coefficient % <-- datasheet
+q_LOV    = 6e3;    % loss-of-vacuum heat flux with MLI [W/m2] (38e3 bare)  % verify EN 13648-3
+T_stack_exit = 100;% vented H2 temperature at chimney exit [K]            % <-- estimate/measure
+
+% ---- Measured data (unified logger EU-CSV: ';' separator, ',' decimal) ----
+data_file   = '';             % e.g. 'C:\TACOMA\logs\run.csv'              % <-- set to use section 12
+col_time    = 'timestamp';                                               % <-- CHECK column names
+col_p       = 'p_tank';
+p_unit      = 1e5;            % bar -> Pa
+p_is_gauge  = true;           % JUMO relative transmitter
+col_T_liq   = 'T_sensor_1';   % DT-670 bottom (liquid)
+col_T_vap   = 'T_sensor_2';   % DT-670 top (vapour)
+col_dp      = 'dp_level';     % JUMO dTRANS p20 DELTA (bottom - top) = level signal
+dp_unit     = 100;            % mbar -> Pa
+make_demo_log = true;         % no real log yet -> SYNTHETIC demo log (clearly fake)
+m_fill_meas = NaN;            % LH2 mass actually filled [kg] (NaN = model value)
+win_boiloff_h = [NaN NaN];    % [start end] hours in log of steady open-vent boil-off (for heat leak)
+win_leak_h    = [NaN NaN];    % [start end] hours in log of the He pressure hold
+t_fill_h      = 0;            % hour in log when LH2 filling ended (aligns model)
+
+% ---- Constants ----
+N2.g = 1.40; N2.R = 296.8;  N2.cv = N2.R/(N2.g-1); N2.cp = N2.g*N2.cv;
+N2_hfg = 199.2e3;  N2_Tsat = 77.36;  N2_rhoL = 806.1;  N2_cpg = 1040;
+H2_g = 1.40;  H2_R = 4124.2;  H2_cpg = 10.4e3;  He_R = 2077.1;
+GAS.H2 = struct('g',1.405,'R',4124.2,'rho_n',0.0899);
+GAS.He = struct('g',1.667,'R',2077.1,'rho_n',0.1786);
+GAS.N2 = struct('g',1.400,'R', 296.8,'rho_n',1.2506);
+for gn = {'H2','He','N2'}
+  GAS.(gn{1}).cv = GAS.(gn{1}).R/(GAS.(gn{1}).g-1);  GAS.(gn{1}).cp = GAS.(gn{1}).g*GAS.(gn{1}).cv;
+  GAS.(gn{1}).p_line = p_line_g.(gn{1}) + patm;
+  GAS.(gn{1}).md_line = Q_line_max*GAS.(gn{1}).rho_n/3600;
+  GAS.(gn{1}).md_reg  = Q_reg.(gn{1})*GAS.(gn{1}).rho_n/3600;
+end
+A_f = pi/4*d_feed^2;  A_v = pi/4*d_vent^2;  A_SV = pi/4*d_SV^2;
+sigma = 5.670e-8;
+
+%% 1) GEOMETRY, STEEL MASS, LEVEL-VOLUME CURVE ===========================
+Ri = Ro - t_wall;  h_head = head_k*Ri;
+V_cyl = pi*Ri^2*L_cyl;  V_head = (2/3)*pi*Ri^2*h_head;
+V  = V_cyl + 2*V_head;                                   % internal volume [m3]
+a = Ro; c = head_k*Ro;
+if abs(c - a) < 1e-9
+  A_head = 2*pi*a^2;
+else
+  e = sqrt(1 - c^2/a^2);
+  A_head = pi*a^2 + pi*c^2/(2*e)*log((1+e)/(1-e));
+end
+A_out   = 2*pi*Ro*L_cyl + 2*A_head;                      % outer surface inner vessel [m2]
+m_steel = rho_ss*A_out*t_wall + m_extra;                 % steel that must be chilled [kg]
+
+% Liquid height vs volume (horizontal tank). Both heads together = one spheroid.
+hgt   = linspace(0, 2*Ri, 400);
+A_seg = Ri^2*acos((Ri-hgt)/Ri) - (Ri-hgt).*sqrt(max(2*Ri*hgt - hgt.^2, 0));
+fracV_of_h = (L_cyl*A_seg + (4/3)*pi*Ri^2*h_head*(hgt.^2.*(3*Ri-hgt))/(4*Ri^3)) / V;
+
+fprintf('=== 1) GEOMETRY ===\n');
+fprintf('Ri %.1f mm | head depth %.1f mm | V = %.1f L (cyl %.1f + 2 x %.1f) | area %.2f m2 | steel ~%.0f kg\n\n', ...
+        1e3*Ri, 1e3*h_head, 1e3*V, 1e3*V_cyl, 1e3*V_head, A_out, m_steel);
+
+%% 2) LH2 SATURATION TABLE ================================================
+% para-H2 saturated: p[bar a] T[K] rhoL rhoV [kg/m3] uL uV hL hV [kJ/kg]
+TAB = [
+    1.00   20.227   70.879    1.3228     -1.85    370.22     -0.44    445.82
+    1.25   21.001   69.975    1.6193      5.70    372.65      7.48    449.84
+    1.50   21.671   69.157    1.9129     12.50    374.46     14.67    452.87
+    1.75   22.265   68.402    2.2051     18.76    375.83     21.32    455.19
+    2.00   22.802   67.693    2.4967     24.61    376.85     27.56    456.96
+    2.25   23.293   67.021    2.7885     30.12    377.61     33.48    458.30
+    2.50   23.747   66.379    3.0810     35.37    378.14     39.13    459.28
+    2.75   24.169   65.760    3.3749     40.39    378.48     44.57    459.96
+    3.00   24.566   65.162    3.6704     45.22    378.65     49.82    460.39
+    3.25   24.940   64.580    3.9679     49.89    378.69     54.92    460.60
+    3.50   25.294   64.013    4.2679     54.42    378.59     59.89    460.60
+    3.75   25.631   63.456    4.5706     58.84    378.38     64.75    460.43
+    4.00   25.952   62.910    4.8764     63.15    378.07     69.51    460.10
+    4.25   26.260   62.371    5.1855     67.37    377.65     74.18    459.61
+    4.50   26.555   61.839    5.4984     71.51    377.15     78.78    458.99
+    4.75   26.839   61.313    5.8152     75.58    376.55     83.33    458.23
+    5.00   27.112   60.790    6.1364     79.59    375.87     87.81    457.35
+    5.25   27.376   60.271    6.4623     83.55    375.11     92.26    456.35
+    5.50   27.632   59.754    6.7932     87.46    374.28     96.66    455.24
+    5.75   27.879   59.237    7.1295     91.33    373.36    101.04    454.01
+    6.00   28.119   58.721    7.4717     95.18    372.37    105.39    452.67
+    6.25   28.352   58.205    7.8201     98.99    371.30    109.73    451.22
+    6.50   28.579   57.687    8.1753    102.79    370.15    114.06    449.66
+    6.75   28.799   57.166    8.5377    106.57    368.93    118.38    447.99
+    7.00   29.014   56.642    8.9080    110.34    367.63    122.70    446.21
+    7.25   29.224   56.113    9.2868    114.11    366.25    127.03    444.32
+    7.50   29.428   55.580    9.6747    117.88    364.78    131.38    442.31
+    7.75   29.628   55.040   10.0726    121.66    363.23    135.74    440.17
+    8.00   29.823   54.492   10.4814    125.46    361.59    140.14    437.92
+    8.25   30.014   53.936   10.9020    129.27    359.85    144.56    435.53
+    8.50   30.200   53.369   11.3357    133.11    358.02    149.04    433.00
+    8.75   30.383   52.791   11.7838    136.99    356.07    153.56    430.33
+    9.00   30.562   52.199   12.2479    140.91    354.01    158.15    427.49
+    9.25   30.738   51.592   12.7298    144.88    351.82    162.81    424.48
+    9.50   30.910   50.966   13.2318    148.92    349.49    167.56    421.29
+    9.75   31.079   50.320   13.7565    153.04    347.01    172.41    417.89
+   10.00   31.244   49.649   14.3072    157.25    344.36    177.39    414.26
+   10.25   31.407   48.950   14.8880    161.58    341.51    182.52    410.36
+   10.50   31.566   48.216   15.5041    166.05    338.44    187.82    406.16
+   10.75   31.723   47.441   16.1622    170.69    335.11    193.35    401.62
+   11.00   31.877   46.616   16.8714    175.54    331.46    199.14    396.66
+   11.25   32.028   45.727   17.6443    180.67    327.42    205.27    391.18
+   11.50   32.177   44.756   18.4991    186.15    322.91    211.85    385.07
+   11.75   32.323   43.675   19.4639    192.13    317.74    219.03    378.11
+   12.00   32.466   42.435   20.5858    198.81    311.68    227.09    369.98
+];
+S.p = TAB(:,1)*1e5; S.T = TAB(:,2); S.rl = TAB(:,3); S.rv = TAB(:,4);
+S.ul = TAB(:,5)*1e3; S.uv = TAB(:,6)*1e3; S.hl = TAB(:,7)*1e3; S.hv = TAB(:,8)*1e3;
+sat = @(f, p) interp1(S.p, S.(f), p);                  % sat('T', 5e5) = T_sat at 5 bar a
+
+p_fill = patm;                                        % vent open to the chimney -> tank at ~1 atm
+p_MEOP = MEOP_g + patm;  p_rel = 1.1*MEOP_g + patm;   % safety valve set / max relieving pressure
+p_test = p_leaktest_g + patm;                         % warm He leak test (vent capped)
+Gc = struct('g',1.40,'R',4124.2,'rho_n',0.0899);     % cold GH2 for vent calculations
+
+
+%% 3) PRESSURE LEVELS & BURST (structural) ================================
+% Burst = shell failure (uses Rm): thin-wall, Faupel thick-wall, 2:1 head.
+% Allowable PS (EN 13445 style): f = min(Rp/1.5, Rm/2.4); PS = 2 f z t/(De - t)
+Di = 2*Ri;  De = 2*Ro;
+pb_thin   = Rm*t_wall/Ri;
+pb_faupel = (2/sqrt(3))*Rp02*(2 - Rp02/Rm)*log(Ro/Ri);
+pb_head   = 2*Rm*t_wall/(Di + 0.2*t_wall);
+p_burst_g = min([pb_thin pb_faupel pb_head]);
+f_allow   = min(Rp02/1.5, Rm/2.4);
+PS_shell_g = min(2*f_allow*z_weld*t_wall/(De - t_wall), 2*f_allow*z_weld*t_wall/(Di + 0.2*t_wall));
+PS_g      = min(PS_shell_g, PS_comp_g);
+PT_g      = 1.43*PS_g;                                  % PED hydrostatic test pressure
+E_gas     = @(p) p*V/(N2.g-1)*(1 - (patm/p)^((N2.g-1)/N2.g));   % stored energy if gas-filled
+
+fprintf('=== 3) PRESSURE LEVELS [bar g] ===\n');
+fprintf('Normal (vent open) ~0 | alarm %.2f | He leak test %.2f | MEOP = safety valves %.2f | SV +10%% %.2f | PS %.2f | hydro test %.2f | burst %.0f\n', ...
+        p_alarm_g/1e5, p_leaktest_g/1e5, MEOP_g/1e5, 1.1*MEOP_g/1e5, PS_g/1e5, PT_g/1e5, p_burst_g/1e5);
+chk(p_leaktest_g <= 0.9*MEOP_g,  'He leak test pressure <= 90 % of safety-valve set (valves stay tight)');
+chk(p_alarm_g < MEOP_g,          'blocked-vent alarm below MEOP');
+if has_SV
+  chk(1.1*MEOP_g <= PS_g,        'safety valve +10 % <= system allowable PS');
+else
+  fprintf('  [WARN] no safety valves / burst disc: nothing limits pressure if the vent is blocked (see 8c and 11)\n');
+end
+chk(PT_g < p_burst_g,            'hydro test pressure < burst');
+chk(p_burst_g/MEOP_g >= SF_req,  sprintf('burst factor >= %.1f (is %.0f)', SF_req, p_burst_g/MEOP_g));
+fprintf('Stored gas energy: %.0f kJ at leak test, %.0f kJ at MEOP -> proof/burst tests with WATER\n\n', ...
+        E_gas(p_test)/1e3, E_gas(p_MEOP)/1e3);
+figure(1); clf; set(gcf,'Name','Fig 1 pressure levels','Color','w');
+lv = [0.002, p_alarm_g, p_leaktest_g, MEOP_g, 1.1*MEOP_g, PS_g, PT_g]/1e5;
+if has_SV, l4 = 'MEOP / safety valves'; l5 = 'SV +10%'; else, l4 = 'MEOP (no valve here!)'; l5 = '1.1 x MEOP'; end
+barh(lv); set(gca,'YTick',1:7,'YTickLabel',{'Normal: vent open (~0)','Alarm: vent blocked','He leak test (vent capped)',l4,l5,'PS system','Hydro test'});
+xlabel('pressure [bar g]'); grid on; xlim([0 1.2*max(lv)]);
+for k = 1:7, text(lv(k), k, sprintf('  %.2f', lv(k))); end
+title(sprintf('Fig 1 - pressure levels of the tank (shell burst %.0f bar g, off scale)', p_burst_g/1e5));
+
+%% 4) PHASE A - He PURGE + LEAK-CHECK LIMITS =============================
+% Vent open -> SWEEP purge: He flows in, mixed gas flows out through the vent.
+% Perfect mixing: c = c0 * exp(-N), N = tank volumes of He flushed through.
+% Pressure purge (vent capped): each cycle c -> c * (p_low/p_high).
+Gp = GAS.He;
+md_He = min(orifice(Cd_feed*A_f, Gp.p_line, T_room, patm, Gp.g, Gp.R), Gp.md_line);  % feed into open tank
+N_O2  = log(0.21/c_target_O2);   N_N2 = log(1/c_target_N2);
+m_sw  = @(N) N*patm*V/(Gp.R*T_room);                   % He mass for N volumes at ~1 atm
+r     = p_vent_low/p_purge_high;
+n_O2  = purge_cycles(0.21, c_target_O2, r);  n_N2 = purge_cycles(1.0, c_target_N2, r);
+Q_min_p = 10*V*dp_res/t_hold;                           % mbar*L/s (1 Pa m3/s = 10 mbar L/s)
+Q_min_T = 10*V*(p_hold*dT_res/T_room)/t_hold;
+fprintf('=== 4) PHASE A: He PURGE (%s) ===\n', purge_mode);
+fprintf('Sweep purge (vent open): O2 < %.0f ppm after %.1f tank volumes = %.0f g He, %.1f min at %.1f g/s\n', ...
+        1e6*c_target_O2, N_O2, 1e3*m_sw(N_O2), m_sw(N_O2)/md_He/60, 1e3*md_He);
+fprintf('Sweep purge after LN2 drain: N2 < %.0f ppm after %.1f volumes = %.0f g He, %.1f min\n', ...
+        1e6*c_target_N2, N_N2, 1e3*m_sw(N_N2), m_sw(N_N2)/md_He/60);
+fprintf('Pressure purge alternative (vent capped, %.0f bar g): %d cycles for O2, %d for N2\n', (p_purge_high-patm)/1e5, n_O2, n_N2);
+fprintf('Sweep needs He inlet and vent outlet far apart; dead legs (sensor ports, dTRANS lines) purge worse -> O2 analyser at the vent\n');
+fprintf('Leak test (vent capped, %.0f bar g): pressure hold sees leaks > %.2f mbar*L/s (resolution) / %.2f (%.1f K drift) -> He sniffer below\n\n', ...
+        p_leaktest_g/1e5, Q_min_p, Q_min_T, dT_res);
+figure(2); clf; set(gcf,'Name','Fig 2 purge','Color','w');
+Nv = linspace(0, max(N_O2, N_N2)+1, 200);
+semilogy(Nv, 0.21*exp(-Nv)*1e6, Nv, 1.0*exp(-Nv)*1e6, '--', 'LineWidth',1.5); hold on; grid on;
+plot(Nv([1 end]), 1e6*c_target_O2*[1 1], 'r:', Nv([1 end]), 1e6*c_target_N2*[1 1], 'k:');
+xlabel('tank volumes of He flushed through'); ylabel('impurity [ppm]');
+legend('O_2 (air in tank)','N_2 (after LN_2 drain)','O_2 target','N_2 target');
+title('Fig 2 - He sweep purge through the open tank');
+
+%% 5) PHASE B/C/D - CHILLDOWN ============================================
+% Heat in the steel: dH = m * integral(cp dT). Cryogen used lies between
+%   worst: latent heat only (cold gas leaves unused)
+%   best : gas also warms up to the steel temperature before leaving
+TT = [20 30 40 50 60 77 100 125 150 175 200 250 293.15];
+cp = [12 27 58 98 136 195 255 305 345 375 400 440 475];       % 304/316 SS approx [J/kgK]
+H_ss = @(T) interp1(TT, cumtrapz(TT, cp), T);
+hfg_H2 = sat('hv',p_fill) - sat('hl',p_fill);
+dH_B = m_steel*(H_ss(T_room) - H_ss(N2_Tsat));
+dH_D = m_steel*(H_ss(N2_Tsat) - H_ss(20.3));
+dH_X = m_steel*(H_ss(T_room) - H_ss(20.3));
+mLN2  = dH_B ./ [N2_hfg, N2_hfg + N2_cpg*(T_room - N2_Tsat)];     % [worst best]
+mLH2  = dH_D ./ [hfg_H2, hfg_H2 + H2_cpg*(N2_Tsat - 20.3)];
+mLH2x = dH_X ./ [hfg_H2, hfg_H2 + H2_cpg*(T_room - 20.3)];
+fprintf('=== 5) CHILLDOWN (steel %.0f kg) ===\n', m_steel);
+fprintf('B  LN2 293->77 K : %.2f MJ -> %.1f-%.1f kg LN2\n', dH_B/1e6, mLN2(2), mLN2(1));
+fprintf('C  after LN2 drain: He sweep of %.1f tank volumes to N2 < %.0f ppm (section 4)\n', N_N2, 1e6*c_target_N2);
+fprintf('D  LH2 77->20 K  : %.2f MJ -> %.2f-%.2f kg LH2 (without LN2 pre-cool: %.1f-%.1f kg)\n\n', ...
+        dH_D/1e6, mLH2(2), mLH2(1), mLH2x(2), mLH2x(1));
+figure(3); clf; set(gcf,'Name','Fig 3 chilldown','Color','w');
+subplot(1,2,1); Tp = linspace(20.3, T_room, 200);
+plot(Tp, m_steel*H_ss(Tp)/1e6, 'LineWidth',1.5); hold on; grid on;
+plot([N2_Tsat N2_Tsat], [0 m_steel*H_ss(T_room)/1e6], 'k--');
+xlabel('steel temperature [K]'); ylabel('heat to remove [MJ]'); title('Fig 3a - heat stored in the steel');
+subplot(1,2,2);
+bar([mLN2; mLH2; mLH2x]); set(gca,'XTickLabel',{'LN2 293-77','LH2 77-20','LH2 293-20'});
+ylabel('cryogen [kg]'); grid on; legend('worst (latent only)','best (cold gas used)');
+title('Fig 3b - cryogen needed');
+
+%% 6) PHASE D - LH2 CAPACITY + FILL HEIGHT ================================
+% Worst moment = vent blocked and safety valves relieving. Liquid must still be <= 95 % then.
+% Same mass at fill (closed tank) -> allowed fill level at 1 atm.
+rho_max = fill_max_at_relief*sat('rl',p_rel) + (1-fill_max_at_relief)*sat('rv',p_rel);
+rho_lim = rho_max;                                       % safety limit density
+if isnan(fill_target)
+  rho0 = rho_max;
+else
+  rho0 = fill_target*sat('rl',p_fill) + (1-fill_target)*sat('rv',p_fill);
+  if rho0 > rho_max, fprintf('WARNING: fill_target above safety limit -> limited\n'); rho0 = rho_max; end
+end
+m0 = rho0*V;   if ~isnan(m_fill_meas), m0 = m_fill_meas; rho0 = m0/V; end
+f_lim = liq_frac(rho_lim, p_fill, sat);
+fill_frac = liq_frac(rho0, p_fill, sat);
+h_fill = interp1(fracV_of_h, hgt, fill_frac);
+fprintf('=== 6) LH2 CAPACITY ===\n');
+fprintf('100 %% liquid would be %.2f kg (not allowed); safety limit %.1f %% = %.2f kg\n', sat('rl',p_fill)*V, 100*f_lim, rho_lim*V);
+fprintf('Planned fill %.2f kg = %.1f %% liquid (%.1f L) + %.1f L gas space | liquid height %.0f of %.0f mm\n', ...
+        m0, 100*fill_frac, 1e3*fill_frac*V, 1e3*(1-fill_frac)*V, 1e3*h_fill, 2e3*Ri);
+fprintf('Liquid expands %.1f %% between 1 atm and safety-valve relieving pressure\n', 100*(sat('rl',p_fill)/sat('rl',p_rel) - 1));
+g0 = 9.81;
+dp_LH2 = (sat('rl',p_fill) - sat('rv',p_fill))*g0*h_fill;
+dp_LN2 = (N2_rhoL - 4.6)*g0*h_fill;
+fprintf('dTRANS level signal at this fill: LH2 %.2f mbar | LN2 %.1f mbar (same height) -> check dTRANS range/accuracy!\n\n', ...
+        dp_LH2/100, dp_LN2/100);
+figure(4); clf; set(gcf,'Name','Fig 4 fill level','Color','w');
+plot(100*fracV_of_h, 1e3*hgt, 'LineWidth',1.5); hold on; grid on;
+plot(100*fill_frac, 1e3*h_fill, 'ro', 'MarkerFaceColor','r');
+plot(100*f_lim, 1e3*interp1(fracV_of_h, hgt, f_lim), 'ks', 'MarkerFaceColor','k');
+xlabel('liquid volume [%]'); ylabel('liquid height from bottom [mm]');
+legend('horizontal tank','planned fill','safety limit','Location','northwest');
+title('Fig 4 - fill level: volume vs liquid height');
+
+%% 7) HEAT LEAK ===========================================================
+eps_eff = 1/(1/eps_in + 1/eps_out - 1);
+Q_rad   = sigma*eps_eff*A_out*(T_room^4 - 20.3^4);
+Q_leak  = Q_cond + q_MLI*A_out*use_MLI + Q_rad*(~use_MLI);
+if ~isnan(Q_leak_override), Q_leak = Q_leak_override; end
+fprintf('=== 7) HEAT LEAK: %.1f W used (bare radiation would be %.1f W) ===\n\n', Q_leak, Q_rad + Q_cond);
+
+
+%% 8) BOIL-OFF WITH THE VENT OPEN, AND WHAT HAPPENS IF IT BLOCKS ==========
+% 8a) Model check against the HYDROS 250 datasheet (calibrates the blocked-vent times)
+Vh = 0.266;  mh = 13.7;  rh = mh/Vh;  p12 = 1.2e5 + patm;  p6 = 6e5 + patm;
+Qh = 0.011/3600*(sat('hv',p12) - sat('hl',p12))/(1 - sat('rv',p12)/sat('rl',p12));
+th = mh*(u_mix(rh, p6, sat) - u_mix(rh, p12, sat))/Qh;
+k_strat = th/3600/32;                                  % real pressure rise is this much faster
+r202 = 0.202/Vh*sat('rl',p_fill) + (1 - 0.202/Vh)*sat('rv',p_fill);
+fprintf('=== 8a) HYDROS 250 CHECK ===\n');
+fprintf('Fill rule: 202 L of 266 L -> %.1f %% liquid at 6 bar g (our rule 95 %%) -> confirmed\n', 100*liq_frac(r202, p6, sat));
+fprintf('Heat leak from 11 g/h: %.2f W | closed-tank pressure rise: model %.0f h vs datasheet 32 h -> real is %.1fx faster\n\n', Qh, th/3600, k_strat);
+
+% 8b) Open vent: tank stays at ~1 atm (+ tiny line/header pressure drop), LH2 at T_sat(1 atm).
+%     All heat leak evaporates liquid:  dm_liquid/dt = -Q / h_fg
+%     Vented gas = evaporated - gas that fills the space the liquid left: Q/h_fg * (1 - rhoV/rhoL)
+hfg0  = sat('hv',p_fill) - sat('hl',p_fill);
+mL0   = fill_frac*V*sat('rl',p_fill);                  % liquid mass after filling [kg]
+md_bo = Q_leak/hfg0*(1 - sat('rv',p_fill)/sat('rl',p_fill));
+p_tank_open = p_needed(md_bo, sat('T',p_fill), Gc, Cd_vent*A_v, VH, patm);
+t_empty_Q = mL0*hfg0./Q_sweep;                          % [s] time until liquid is gone
+t_empty   = mL0*hfg0/Q_leak;
+fprintf('=== 8b) OPEN VENT BOIL-OFF (fill %.2f kg liquid at %.2f K) ===\n', mL0, sat('T',p_fill));
+fprintf('Tank pressure with vent open: %.2f Pa above ambient (vent line + header) -> effectively 1 atm\n', p_tank_open-patm);
+fprintf('   heat leak [W]  boil-off [g/h]  liquid lasts [h]  [days]\n');
+for k = 1:numel(Q_sweep)
+  fprintf('   %12.1f  %14.1f  %16.0f  %6.1f\n', Q_sweep(k), 3.6e6*Q_sweep(k)/hfg0*(1-sat('rv',p_fill)/sat('rl',p_fill)), t_empty_Q(k)/3600, t_empty_Q(k)/86400);
+end
+fprintf('With the current estimate (%.1f W): %.0f g/h, empty after %.1f days. Perfect insulation (0 W): never.\n\n', ...
+        Q_leak, 3.6e6*md_bo, t_empty/86400);
+
+% 8c) Vent BLOCKED (ice, closed valve, forgotten cap): closed tank from 1 atm.
+%     Homogeneous energy balance (upper bound) and HYDROS-calibrated estimate (/k_strat).
+t_alarm = m0*(u_mix(rho0, p_alarm_g+patm, sat) - u_mix(rho0, p_fill, sat))/Q_leak;
+t_MEOPc = m0*(u_mix(rho0, p_MEOP, sat)         - u_mix(rho0, p_fill, sat))/Q_leak;
+fprintf('=== 8c) VENT BLOCKED (closed tank) at %.1f W ===\n', Q_leak);
+fprintf('Alarm (%.1f bar g): %.1f h model / ~%.1f h realistic | MEOP (%.0f bar g): %.1f h model / ~%.1f h realistic\n', ...
+        p_alarm_g/1e5, t_alarm/3600, t_alarm/3600/k_strat, MEOP_g/1e5, t_MEOPc/3600, t_MEOPc/3600/k_strat);
+p_PS   = min(PS_g + patm, S.p(end));
+t_PSc  = m0*(u_mix(rho0, p_PS, sat) - u_mix(rho0, p_fill, sat))/Q_leak;
+fprintf('Tank limit PS (%.1f bar g): %.1f h model / ~%.1f h realistic', (p_PS-patm)/1e5, t_PSc/3600, t_PSc/3600/k_strat);
+if has_SV, fprintf(' (not reached: safety valves open at MEOP)\n'); else, fprintf('  <- NO valve stops this: an operator must open another vent path in time\n'); end
+fprintf('Liquid at MEOP: %.0f %% of the tank (limit %.0f %%)\n\n', 100*liq_frac(rho0, p_MEOP, sat), 100*fill_max_at_relief);
+tt = linspace(0, 1.02*ternary(has_SV, t_MEOPc, t_PSc), 300);
+pp = arrayfun(@(t) p_from_rho_u(rho0, u_mix(rho0, p_fill, sat) + Q_leak*t/m0, S), tt);
+
+figure(5); clf; set(gcf,'Name','Fig 5 boil-off','Color','w');
+subplot(2,1,1); hold on; grid on;
+lab = cell(1, numel(Q_sweep));
+for k = 1:numel(Q_sweep)
+  td = linspace(0, t_empty_Q(k), 100);
+  plot(td/86400, 100*fill_frac*(1 - td/t_empty_Q(k)), 'LineWidth', 1.2);
+  lab{k} = sprintf('%.1f W', Q_sweep(k));
+end
+xlabel('time after filling [days]'); ylabel('liquid [% of tank]'); legend(lab, 'Location','northeast');
+title('Fig 5a - vent open: liquid left vs time for different heat leaks');
+subplot(2,1,2); plot(tt/3600, (pp-patm)/1e5, tt/3600/k_strat, (pp-patm)/1e5, '--', 'LineWidth',1.5); hold on; grid on;
+plot(tt([1 end])/3600, p_alarm_g/1e5*[1 1], 'm:', tt([1 end])/3600, MEOP_g/1e5*[1 1], 'r--', tt([1 end])/3600, PS_g/1e5*[1 1], 'k--');
+xlabel('time after vent blocks [h]'); ylabel('p [bar g]');
+legend('model (upper bound)', sprintf('HYDROS-calibrated (/%.1f)', k_strat), 'alarm', 'MEOP', 'PS (tank limit)', 'Location','southeast');
+title(sprintf('Fig 5b - vent BLOCKED: pressure rise at %.1f W', Q_leak));
+
+figure(9); clf; set(gcf,'Name','Fig 9 heat-leak sensitivity','Color','w');
+t_blk_Q = t_MEOPc*Q_leak./Q_sweep;
+loglog(Q_sweep, t_empty_Q/3600, 'o-', Q_sweep, t_blk_Q/3600, 's-', Q_sweep, t_blk_Q/3600/k_strat, 's--', 'LineWidth',1.5); grid on;
+xlabel('heat leak Q [W]'); ylabel('time [h]');
+legend('vent open: LH2 lasts', 'vent blocked: to MEOP (model)', 'vent blocked: to MEOP (realistic)');
+title('Fig 9 - all times scale with 1/heat leak');
+
+%% 10) He LEAK TEST ON THE WARM TANK: PRESSURISATION + BLOWDOWN =========
+% Vent fitting capped, He from the SVE line through the panel regulator to 4 bar g.
+% Afterwards the cap is removed and the tank blows down through the open 1" line.
+% Tank energy (open system):  m cv dT/dt = mdot_in (cp T_in - cv T) - mdot_out R T + Q
+G  = GAS.(ops_gas);  dt = 0.02;
+mt = patm*V/(G.R*T_room); Tt = T_room;  tp = 0; pt_ = patm; Tp_ = Tt; k = 1;
+while tp(k) < 3600
+  md = min(orifice(Cd_feed*A_f, min(p_test, G.p_line), T_room, pt_(k), G.g, G.R), G.md_line);
+  Tt = Tt + dt*(md*(G.cp*T_room - G.cv*Tt) + h_wall*A_out*(T_room - Tt))/(mt*G.cv);
+  mt = mt + dt*md;  k = k + 1;
+  tp(k) = tp(k-1) + dt;  pt_(k) = mt*G.R*Tt/V;  Tp_(k) = Tt;
+  if pt_(k) >= 0.99*p_test + 0.01*patm, break; end
+end
+dt = 0.002;  T = Tt;  mg = mt;  tb = 0; pb = pt_(end); k = 1;
+while pb(k) > patm*1.01 && k < 1e6
+  md = vent_flow(Cd_vent*A_v, pb(k), T, G, VH, patm);
+  T  = T + dt*(-md*G.R*T + h_wall*A_out*(T_room - T))/(mg*G.cv);
+  mg = mg - dt*md;  k = k + 1;
+  tb(k) = tb(k-1) + dt;  pb(k) = mg*G.R*T/V;
+end
+fprintf('=== 10) %s LEAK TEST (warm tank, vent capped) ===\n', ops_gas);
+fprintf('Pressurise 0 -> %.0f bar g via %.1f mm: %.0f s, gas heats to %.0f K (no heat exchange)\n', p_leaktest_g/1e5, 1e3*d_feed, tp(end), max(Tp_));
+fprintf('Cooling back to room T: pressure falls to ~%.2f bar g WITHOUT any leak -> wait for stable T, compare p/T\n', ...
+        (pt_(end)*T_room/Tp_(end) - patm)/1e5);
+fprintf('Cap removed: blowdown through the open 1" line in %.1f s\n\n', tb(end));
+figure(6); clf; set(gcf,'Name','Fig 6 leak-test pressurisation','Color','w');
+subplot(2,1,1); plot(tp, (pt_-patm)/1e5, 'LineWidth',1.5); grid on; ylabel('p [bar g]');
+title(sprintf('Fig 6 - %s leak test: filling to %.0f bar g (vent capped)', ops_gas, p_leaktest_g/1e5));
+subplot(2,1,2); plot(tp, Tp_, 'LineWidth',1.5); grid on; ylabel('T_{gas} [K]'); xlabel('t [s]');
+
+%% 11) OPEN VENT CAPACITY + SAFETY VALVES (no burst disc) ================
+% Cases: (a) loss of insulating vacuum with LH2 inside (cold GH2)
+%        (b) tank-panel regulator fails open: SVE regulator max flow into the tank
+% Q1: can the OPEN 1" vent alone carry the flow (what tank pressure does it need)?
+% Q2: if the vent is BLOCKED, each safety valve must carry it alone at <= 1.1 x MEOP.
+fprintf('=== 11) OPEN VENT + SAFETY VALVES ===\n');
+chk(max([p_line_g.H2 p_line_g.He p_line_g.N2]) <= PS_g, ...
+    sprintf('supply line pressure (%.0f bar g) <= tank PS (%.1f bar g)', max([p_line_g.H2 p_line_g.He p_line_g.N2])/1e5, PS_g/1e5));
+fprintf('   -> if FAIL: panel pressure reducer + safety valves sized for full regulator flow are mandatory\n');
+hfgR   = sat('hv',p_rel) - sat('hl',p_rel);
+md_LOV = q_LOV*A_out/hfgR*(1 - sat('rv',p_rel)/sat('rl',p_rel));
+cases  = {'(a) loss of vacuum, cold GH2', md_LOV, sat('T',p_rel), Gc};
+for gn = {'H2','He','N2'}
+  Gg = GAS.(gn{1});  md_in = Gg.md_reg;
+  if fail_use_restriction, md_in = min(md_in, orifice(Cd_feed*A_f, Gg.p_line, T_room, p_rel, Gg.g, Gg.R)); end
+  cases(end+1,:) = {sprintf('(b) regulator open, %s', gn{1}), md_in, T_room, Gg};
+end
+A_case = zeros(1, size(cases,1));  p_open = A_case;
+fprintf('   case                              flow [g/s]  [Nm3/h]  open vent: tank p [bar g]  blocked: SV d [mm]\n');
+for k = 1:size(cases,1)
+  md = cases{k,2};  Tu = cases{k,3};  Gk = cases{k,4};
+  p_open(k) = p_needed(md, Tu, Gk, Cd_vent*A_v, VH, patm);
+  pbk = p_back(md, Gk.rho_n, VH, patm);
+  A_case(k) = md/(Kd_SV*orifice(1, p_rel, Tu, pbk, Gk.g, Gk.R));
+  fprintf('   %-33s %9.1f %8.0f %20.2f %20.1f\n', cases{k,1}, 1e3*md, md/Gk.rho_n*3600, (p_open(k)-patm)/1e5, 1e3*sqrt(4*A_case(k)/pi));
+end
+[A_req, kgov] = max(A_case);  d_SV_req = sqrt(4*A_req/pi);
+chk(max(p_open) - patm < MEOP_g, 'open 1" vent alone keeps every case below MEOP (vent = the only relief path)');
+if has_SV
+  fprintf('Each of the %d safety valves needs flow diameter >= %.1f mm (blocked vent, governed by %s); installed %.1f mm -> %s\n', ...
+          n_SV, 1e3*d_SV_req, cases{kgov,1}, 1e3*d_SV, okstr(d_SV >= d_SV_req));
+else
+  fprintf('[WARN] NO safety valves: if the vent is blocked nothing relieves pressure. A relief device would need >= %.1f mm (%s)\n', ...
+          1e3*d_SV_req, cases{kgov,1});
+end
+rho_air = patm/(287*T_room);  rho_cold = sat('rv',patm);  rho_exit = patm/(H2_R*T_stack_exit);
+fprintf('Chimney: fresh GH2 %.2f kg/m3 vs air %.2f -> heavier than air until it warms; at %.0f K exit %.3f kg/m3\n', ...
+        rho_cold, rho_air, T_stack_exit, rho_exit);
+fprintf('Open vent: protect against AIR flowing back into the cold tank (check valve / small He purge of the vent)\n');
+% Failure simulation: vent BLOCKED + panel regulator fails open (governing gas), one safety valve.
+[~, kb] = max(A_case(2:end));  Gf = cases{kb+1,4};  md_in = cases{kb+1,2};  gname = cases{kb+1,1};
+A_SVuse = has_SV*max(A_SV, A_req);
+mt = patm*V/(Gf.R*T_room); Tt = T_room;  dt = 1e-3;  tf = 0; pfl = patm; k = 1; sv_open = false;
+while tf(k) < 30
+  pk = mt*Gf.R*Tt/V;
+  if pk >= p_MEOP, sv_open = true; end
+  if sv_open && pk < 0.9*MEOP_g + patm, sv_open = false; end
+  mo = sv_open*vent_flow(Kd_SV*A_SVuse, pk, Tt, Gf, VH, patm);
+  mi = md_in*(pk < Gf.p_line);                      % inflow stops at supply line pressure
+  Tt = Tt + dt*(mi*(Gf.cp*T_room - Gf.cv*Tt) - mo*Gf.R*Tt + h_wall*A_out*(T_room - Tt))/(mt*Gf.cv);
+  mt = mt + dt*(mi - mo);  k = k + 1;
+  tf(k) = tf(k-1) + dt;  pfl(k) = mt*Gf.R*Tt/V;
+end
+i_PS = find(pfl - patm > PS_g, 1);
+if isempty(i_PS)
+  fprintf('Blocked vent + %s: peak %.2f bar g (PS %.2f) -> OK\n\n', gname, (max(pfl)-patm)/1e5, PS_g/1e5);
+else
+  fprintf('Blocked vent + %s, no relief: PS (%.1f bar g) exceeded after %.1f s, tank heads to the supply line pressure -> NOT OK\n\n', ...
+          gname, PS_g/1e5, tf(i_PS));
+end
+figure(7); clf; set(gcf,'Name','Fig 7 blocked vent + regulator failure','Color','w');
+plot(tf, (pfl-patm)/1e5, 'LineWidth',1.5); hold on; grid on;
+plot(tf([1 end]), MEOP_g/1e5*[1 1], 'r--', tf([1 end]), PS_g/1e5*[1 1], 'k--', 'LineWidth',1.2);
+ylim([0 1.15*max(PS_g, max(pfl)-patm)/1e5]); xlabel('t [s]'); ylabel('p [bar g]');
+legend('tank','MEOP','PS (tank limit)','Location','southeast');
+if has_SV
+  title(sprintf('Fig 7 - vent BLOCKED and %s: one safety valve d = %.1f mm', strrep(gname,'(b) ',''), 1e3*sqrt(4*A_SVuse/pi)));
+else
+  title(sprintf('Fig 7 - vent BLOCKED and %s: NO relief valve', strrep(gname,'(b) ','')));
+end
+
+%% 12) MEASURED DATA vs MODEL ============================================
+% With the vent open, pressure stays ~constant, so the heat leak is measured
+% from how fast the LIQUID LEVEL drops (dTRANS):  Q = -(dm_liquid/dt) * h_fg
+% If no real log exists yet and make_demo_log = true, a SYNTHETIC log is written
+% (heat leak x1.5, sensor noise) so you can see Fig 8. DEMO DATA IS NOT A MEASUREMENT.
+is_demo = false;
+if (isempty(data_file) || ~exist(data_file,'file')) && make_demo_log
+  is_demo = true;  data_file = fullfile(tempdir, 'tacoma_DEMO_log_openvent.csv');
+  Qd  = 1.5*Q_leak;  td = (0:60:72*3600)';  rng(1);
+  ld  = max(fill_frac*(1 - td/(mL0*hfg0/Qd)), 0);      % liquid volume fraction
+  hd  = interp1(fracV_of_h, hgt, ld);
+  dpd = (sat('rl',p_fill) - sat('rv',p_fill))*9.81*hd;
+  col = [1.79e12 + 1000*td, (p_tank_open - patm)/1e5 + 0.002*randn(size(td)), ...
+         sat('T',p_fill) + 0.05*randn(size(td)), sat('T',p_fill) + 8*min(td/(12*3600),1) + 0.2*randn(size(td)), ...
+         dpd/100 + 0.02*randn(size(td))];
+  fid = fopen(data_file, 'w');
+  fprintf(fid, '%s;%s;%s;%s;%s\n', col_time, col_p, col_T_liq, col_T_vap, col_dp);
+  for k = 1:size(col,1)
+    fprintf(fid, '%s\n', strrep(sprintf('%.0f;%.5f;%.4f;%.4f;%.4f', col(k,:)), '.', ','));
+  end
+  fclose(fid);
+  win_boiloff_h = [6 66];  t_fill_h = 0;
+end
+if ~isempty(data_file) && exist(data_file, 'file')
+  D = read_eu_csv(data_file);
+  fprintf('=== 12) %s DATA: %d rows ===\nColumns: %s\n', ternary(is_demo,'DEMO (synthetic)','MEASURED'), ...
+          numel(D.(fn(col_time))), strjoin(fieldnames(D)', ' | '));
+  ts = D.(fn(col_time));  th = (ts - ts(1))/1000/3600;
+  pm = D.(fn(col_p))*p_unit + p_is_gauge*patm;
+  TL = D.(fn(col_T_liq));  TV = D.(fn(col_T_vap));
+  pm_in = min(max(pm, S.p(1)), S.p(end));
+  tag = ''; if is_demo, tag = ' [DEMO DATA]'; end
+  tm  = linspace(0, max(th), 200);  lm = max(fill_frac*(1 - (tm - t_fill_h)*3600/t_empty), 0);
+  figure(8); clf; set(gcf,'Name','Fig 8 measured vs model','Color','w');
+  subplot(3,1,1); plot(th, (pm-patm)*1e3/1e5, 'LineWidth',1.0); hold on; grid on;
+  plot(th([1 end]), p_alarm_g*1e3/1e5*[1 1], 'm:');
+  xlim([0 max(th)]); ylabel('p [mbar g]'); legend('measured','alarm (vent blocked)','Location','east');
+  title(['Fig 8a - tank pressure with vent open' tag]);
+  subplot(3,1,2); plot(th, TL, th, TV, th, sat('T', pm_in), 'k--', 'LineWidth',1.2); grid on;
+  xlim([0 max(th)]); ylabel('T [K]'); ylim([15 40]);   % cryogenic range - remove for warm phases
+  legend('T liquid sensor','T vapour sensor','T_{sat}(p measured)','Location','east');
+  title(['Fig 8b - sensors vs boiling temperature' tag]);
+  if isfield(D, fn(col_dp))
+    dpm = D.(fn(col_dp))*dp_unit;
+    hm  = dpm./((sat('rl',pm_in) - sat('rv',pm_in))*9.81);
+    lvm = interp1(hgt, fracV_of_h, min(max(hm,0), 2*Ri));
+    subplot(3,1,3); plot(th, 100*lvm, tm, 100*lm, '--', 'LineWidth',1.2); grid on;
+    xlim([0 max(th)]); ylabel('liquid [%]'); xlabel('t [h]'); legend('from dTRANS','model','Location','northeast');
+    title(['Fig 8c - liquid level from dTRANS vs model' tag]);
+    if all(~isnan(win_boiloff_h))
+      w   = th >= win_boiloff_h(1) & th <= win_boiloff_h(2);
+      mLm = lvm(w).*V.*sat('rl',pm_in(w));
+      c1  = polyfit(th(w)*3600, mLm, 1);               % slope [kg/s]
+      Q_eff = -c1(1)*(sat('hv',mean(pm_in(w))) - sat('hl',mean(pm_in(w))));
+      fprintf('Heat leak from level drop %.0f-%.0f h: %.2f W (model %.2f W, ratio %.2f)\n', ...
+              win_boiloff_h(1), win_boiloff_h(2), Q_eff, Q_leak, Q_eff/Q_leak);
+      fprintf('  -> put this value in Q_leak_override and rerun: all predictions are then calibrated\n');
+    end
+  end
+  if all(~isnan(win_leak_h))
+    i1 = find(th >= win_leak_h(1), 1);  i2 = find(th >= win_leak_h(2), 1);
+    dts = (th(i2)-th(i1))*3600;
+    fprintf('He hold leak: raw %.3f, T-compensated %.3f mbar*L/s (detection limit ~%.2f)\n', ...
+            10*V*(pm(i1)-pm(i2))/dts, 10*V*(pm(i1)/TV(i1) - pm(i2)/TV(i2))*T_room/dts, max(Q_min_p, Q_min_T));
+  end
+  fprintf('\n');
+else
+  fprintf('=== 12) No measured data file set (data_file) - skipped ===\n\n');
+end
+
+%% 13) SUMMARY =============================================================
+fprintf('=== 13) SUMMARY ===\n');
+fprintf('V %.1f L | vent OPEN to chimney (~1 atm, LH2 %.1f K) | MEOP %.0f bar g | safety valves: %s | burst %.0f bar g\n', ...
+        1e3*V, sat('T',p_fill), MEOP_g/1e5, ternary(has_SV,'2 at MEOP','NONE'), p_burst_g/1e5);
+fprintf('He sweep purge %.0f + %.0f g | LN2 %.0f-%.0f kg | LH2 chill %.2f-%.2f kg | fill %.2f kg (%.0f %%)\n', ...
+        1e3*m_sw(N_O2), 1e3*m_sw(N_N2), mLN2(2), mLN2(1), mLH2(2), mLH2(1), m0, 100*fill_frac);
+fprintf('At %.1f W: boil-off %.0f g/h, LH2 lasts %.1f days | if vent blocks: MEOP ~%.1f h, PS ~%.1f h (realistic)\n', ...
+        Q_leak, 3.6e6*md_bo, t_empty/86400, t_MEOPc/3600/k_strat, t_PSc/3600/k_strat);
+
+%% ====================== LOCAL FUNCTIONS ================================
+function pb = p_back(md, rho_n, VH, patm)
+% vent-header back-pressure: turbulent dp ~ rho_n * Q^2, scaled from R&I reference values
+Q  = md/rho_n*3600;                                  % [Nm3/h]
+pb = patm + (rho_n/VH.rho_ref)*(VH.dp40*(Q/VH.Q40)^2 + VH.dp80*(Q/VH.Q80)^2);
+end
+
+function md = vent_flow(CdA, pu, Tu, G, VH, patm)
+% flow from tank into the vent header. The header back-pressure rises with the flow,
+% so solve  md = orifice(pu -> p_back(md))  by bisection (robust for small and large flows)
+lo = 0;  hi = orifice(CdA, pu, Tu, patm, G.g, G.R);
+for it = 1:50
+  mid = 0.5*(lo + hi);
+  if orifice(CdA, pu, Tu, p_back(mid, G.rho_n, VH, patm), G.g, G.R) > mid, lo = mid; else, hi = mid; end
+end
+md = 0.5*(lo + hi);
+end
+
+function n = purge_cycles(c0, ct, r)
+% dilution cycles so that c0*r^n <= ct
+n = max(0, ceil(log(ct/c0)/log(r)));
+end
+
+function md = orifice(CdA, pu, Tu, pd, g, R)
+% compressible ideal-gas orifice flow [kg/s]; pr = max(pd/pu, critical) covers choked + subsonic
+if pu <= pd, md = 0; return; end
+pcr = (2/(g+1))^(g/(g-1));
+pr  = max(pd/pu, pcr);
+md  = CdA*pu*sqrt(2*g/((g-1)*R*Tu)*max(pr^(2/g) - pr^((g+1)/g), 0));
+end
+
+function f = liq_frac(rho, p, sat)
+% liquid VOLUME fraction of a saturated mix with average density rho
+f = (rho - sat('rv',p))/(sat('rl',p) - sat('rv',p));
+end
+
+function u = u_mix(rho, p, sat)
+% specific internal energy of a saturated mix with average density rho at pressure p
+x = (1/rho - 1/sat('rl',p))/(1/sat('rv',p) - 1/sat('rl',p));
+u = sat('ul',p) + x*(sat('uv',p) - sat('ul',p));
+end
+
+function p = p_from_rho_u(rho, u, S)
+% pressure at which a saturated mix of density rho has specific energy u
+x  = (1/rho - 1./S.rl)./(1./S.rv - 1./S.rl);
+ok = x >= 0 & x <= 1;
+if nnz(ok) < 2, p = NaN; return; end
+um = S.ul(ok) + x(ok).*(S.uv(ok) - S.ul(ok));
+pp = S.p(ok);
+[um, ix] = sort(um);
+p = interp1(um, pp(ix), u, 'linear', NaN);
+end
+
+function D = read_eu_csv(file)
+% read EU-CSV (';' separator, ',' decimal); first line = header; numeric columns
+fid = fopen(file, 'r');  hdr = fgetl(fid);  body = fread(fid, '*char')';  fclose(fid);
+names = strsplit(strtrim(hdr), ';');
+body  = strrep(body, ',', '.');
+C = textscan(body, repmat('%f', 1, numel(names)), 'Delimiter', ';', 'CollectOutput', true);
+X = C{1};
+for k = 1:numel(names), D.(fn(names{k})) = X(:,k); end
+end
+
+function f = fn(name)
+% turn a CSV column name into a valid field name ("T [K]" -> "T__K_")
+f = regexprep(strtrim(name), '[^A-Za-z0-9_]', '_');
+if isempty(f) || ~isletter(f(1)), f = ['x' f]; end
+end
+
+function s = ternary(c, a, b)
+if c, s = a; else, s = b; end
+end
+
+function chk(cond, msg)
+if cond, fprintf('  [PASS] %s\n', msg); else, fprintf('  [FAIL] %s\n', msg); end
+end
+
+function s = okstr(c)
+if c, s = 'OK'; else, s = 'NOT OK'; end
+end
+
+function p = p_needed(md, Tu, G, CdA, VH, patm)
+% tank pressure needed to push mass flow md through the open vent (CdA) into the header (bisection)
+lo = patm;  hi = 50e5;
+if vent_flow(CdA, hi, Tu, G, VH, patm) < md, p = Inf; return; end
+for it = 1:60
+  mid = 0.5*(lo + hi);
+  if vent_flow(CdA, mid, Tu, G, VH, patm) < md, lo = mid; else, hi = mid; end
+end
+p = hi;
+end
