@@ -1,0 +1,866 @@
+#  STEPS / FIGURES
+#   1-2  Geometry, LH2 property table
+#   3    Pressure levels & burst                              -> Fig 1
+#   4    He purge + leak-test limits                          -> Fig 2
+#   5    LN2 / LH2 chilldown                                  -> Fig 3
+#   6    LH2 capacity + fill height                           -> Fig 4
+#   7    Heat leak from the drawing                           -> Fig 10
+#   8    HYDROS check, controlled boil-off, valve stuck shut  -> Fig 5, Fig 9
+#   9    Power failure: boil-off valve fails OPEN             -> Fig 11
+#   10   He leak test (boil-off valve closed)                 -> Fig 6
+#   11   Relief capacity, tank safety valves, failure case    -> Fig 7
+#   11b  Trapped line section -> why every section needs a SV -> Fig 12
+#   12   Measured logger data (or DEMO) vs model              -> Fig 8
+#   13   Summary
+#  Pressures in Pa ABSOLUTE unless the name ends in _g (gauge).
+#  Requires: Python 3.8+, numpy, matplotlib      Run:  python tacoma_lh2_model.py
+# =========================================================================
+import math
+import os
+import tempfile
+import numpy as np
+import matplotlib.pyplot as plt
+
+NAN = float('nan')
+
+
+# ====================== FUNCTIONS (local functions in MATLAB) =============
+def p_back(md, rho_n, VH, patm):
+    """vent-header back-pressure: turbulent dp ~ rho_n * Q^2, scaled from R&I reference values"""
+    Q = md / rho_n * 3600.0                                  # [Nm3/h]
+    return patm + (rho_n / VH['rho_ref']) * (VH['dp40'] * (Q / VH['Q40'])**2 + VH['dp80'] * (Q / VH['Q80'])**2)
+
+
+def orifice(CdA, pu, Tu, pd, g, R):
+    """compressible ideal-gas orifice flow [kg/s]; pr = max(pd/pu, critical) covers choked + subsonic"""
+    if pu <= pd:
+        return 0.0
+    pcr = (2.0 / (g + 1.0))**(g / (g - 1.0))
+    pr = max(pd / pu, pcr)
+    return CdA * pu * math.sqrt(2.0 * g / ((g - 1.0) * R * Tu) * max(pr**(2.0 / g) - pr**((g + 1.0) / g), 0.0))
+
+
+def vent_flow(CdA, pu, Tu, G, VH, patm, dpc=0.0):
+    """flow from tank into the vent header; solve md = orifice(pu -> p_back(md) + dpc) by bisection.
+    dpc = check-valve cracking pressure."""
+    lo = 0.0
+    hi = orifice(CdA, pu, Tu, patm + dpc, G['g'], G['R'])
+    for _ in range(50):
+        mid = 0.5 * (lo + hi)
+        if orifice(CdA, pu, Tu, p_back(mid, G['rho_n'], VH, patm) + dpc, G['g'], G['R']) > mid:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def p_needed(md, Tu, G, CdA, VH, patm, dpc=0.0):
+    """tank pressure needed to push mass flow md through the boil-off path (CdA + check valve) (bisection)"""
+    lo, hi = patm, 50e5
+    if vent_flow(CdA, hi, Tu, G, VH, patm, dpc) < md:
+        return math.inf
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if vent_flow(CdA, mid, Tu, G, VH, patm, dpc) < md:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def purge_cycles(c0, ct, r):
+    """dilution cycles so that c0*r^n <= ct"""
+    return max(0, math.ceil(math.log(ct / c0) / math.log(r)))
+
+
+def interp1(x, y, xq):
+    """MATLAB interp1 (linear): NaN outside the data range"""
+    return np.interp(xq, x, y, left=np.nan, right=np.nan)
+
+
+def liq_frac(rho, p, sat):
+    """liquid VOLUME fraction of a saturated mix with average density rho"""
+    return (rho - sat('rv', p)) / (sat('rl', p) - sat('rv', p))
+
+
+def u_mix(rho, p, sat):
+    """specific internal energy of a saturated mix with average density rho at pressure p"""
+    x = (1.0 / rho - 1.0 / sat('rl', p)) / (1.0 / sat('rv', p) - 1.0 / sat('rl', p))
+    return sat('ul', p) + x * (sat('uv', p) - sat('ul', p))
+
+
+def p_from_rho_u(rho, u, S):
+    """pressure at which a saturated mix of density rho has specific energy u"""
+    x = (1.0 / rho - 1.0 / S['rl']) / (1.0 / S['rv'] - 1.0 / S['rl'])
+    ok = (x >= 0) & (x <= 1)
+    if np.count_nonzero(ok) < 2:
+        return NAN
+    um = S['ul'][ok] + x[ok] * (S['uv'][ok] - S['ul'][ok])
+    pp = S['p'][ok]
+    ix = np.argsort(um)
+    return float(np.interp(u, um[ix], pp[ix], left=np.nan, right=np.nan))
+
+
+def read_eu_csv(file):
+    """read EU-CSV (';' separator, ',' decimal); first line = header; numeric columns"""
+    with open(file, 'r') as f:
+        names = f.readline().strip().split(';')
+        rows = [[float(v) for v in line.strip().replace(',', '.').split(';')]
+                for line in f if line.strip()]
+    X = np.array(rows)
+    return {fn(n): X[:, k] for k, n in enumerate(names)}
+
+
+def fn(name):
+    """turn a CSV column name into a valid field name ("T [K]" -> "T__K_")"""
+    import re
+    f = re.sub(r'[^A-Za-z0-9_]', '_', name.strip())
+    if not f or not f[0].isalpha():
+        f = 'x' + f
+    return f
+
+
+def ternary(c, a, b):
+    return a if c else b
+
+
+def chk(cond, msg):
+    print(f"  [{'PASS' if cond else 'FAIL'}] {msg}")
+
+
+def okstr(c):
+    return 'OK' if c else 'NOT OK'
+
+
+def cumtrapz(x, y):
+    out = np.zeros_like(np.asarray(y, dtype=float))
+    out[1:] = np.cumsum(0.5 * (y[1:] + y[:-1]) * np.diff(x))
+    return out
+
+
+# =========================================================================
+def main():
+    plt.close('all')
+
+    # %% 0) INPUTS ===========================================================
+    Ro = 381.68e-3 / 2 + 9.5e-3
+    L_cyl = 0.7919
+    t_wall = 9.5e-3
+    head_k = 0.465
+    rho_ss = 7950
+    m_extra = 20
+
+    # ---- Material 1.4404 / 316L, room temperature (EN 10028-7)
+    Rp02 = 220e6          # yield [Pa]
+    Rm = 520e6            # tensile [Pa]
+    z_weld = 1.0          # weld joint efficiency EN 13445
+
+    # ---- Pressure levels and valve settings ----
+    patm = 1.01325e5
+    vent_type = 'actuated'  # 'relief'   = NO controlled valve: self-acting SPRING relief valve on the boil-off line
+                            # 'actuated' = PLC-controlled boil-off valve from the pressure transmitter (fail-open)
+                            # Either way: open below MEOP, and the 2 tank SVs at MEOP are only the backup.
+    p_bov_open_g = 4.0e5    # boil-off valve OPENS at this tank pressure = operating pressure [Pa g]
+    p_bov_close_g = 3.8e5   # boil-off valve CLOSES again here (control hysteresis) [Pa g]
+    #   NOT 6.0: 6.0 bar g is where the 2 tank SAFETY valves open (MEOP). The boil-off valve must
+    #   work BELOW them (<= 90 % of 6.0 = 5.4 bar g), otherwise both open together and the SVs leak/chatter.
+    dp_crack = 0.1e5        # check valve cracking pressure [Pa] (one-way valve before the header)
+    p_alarm_g = 5.0e5       # high-pressure alarm: boil-off path not working [Pa g]
+    p_leaktest_g = 4.0e5    # He leak test pressure, warm tank, boil-off valve closed [Pa g]
+    MEOP_g = 7.0e5          # set pressure of the 2 tank safety valves [Pa g]  (7 bar a would be 6.0e5 !)
+    has_SV = True           # tank safety valves fitted (False = no tank SV)
+    n_SV = 2                # number of tank safety valves (each must carry the worst case alone)
+    p_lineSV_g = 6.5e5      # line safety valves on sections closable at both ends [Pa g]
+    PS_comp_g = 10e5        # rating of weakest component (flange, feedthrough, sensor) [Pa g]
+    SF_req = 4.0            # required burst factor vs MEOP
+    fill_max_at_relief = 0.95  # liquid <= 95 % of volume even at safety-valve relieving pressure
+    fill_target = 0.50      # planned fill: liquid volume fraction at 1 atm (NaN = fill to the safety limit)
+
+    # ---- Phase A/C: He purge ----
+    purge_mode = 'sweep'    # 'sweep' = He flows through the open tank at ~1 atm (vent open)
+    p_purge_high = p_leaktest_g + patm  # pressure-purge fill [Pa abs]
+    p_vent_low = 1.1e5      # pressure-purge low point [Pa abs]
+    c_target_O2 = 100e-6    # target O2 before cryogens [mol/mol]
+    c_target_N2 = 1e-3      # target N2 before LH2 (N2 freezes at 63 K)
+
+    # ---- Phase A: He pressure-hold leak test (boil-off valve closed) ----
+    p_hold = p_leaktest_g + patm  # hold pressure [Pa abs] = leak-test pressure (4 bar g)
+    t_hold = 3600           # hold time [s]
+    dp_res = 500            # transmitter resolution/accuracy [Pa] (5 mbar)
+    dT_res = 0.1            # temperature uncertainty during hold [K]
+
+    # ---- Heat leak ----
+    T_room = 293.15
+    use_MLI = True          # Multi layer insulation
+    eps_in, eps_out, q_MLI = 0.05, 0.30, 1.0   # inner SS polished / outer box steel inside
+    # Conduction through every penetration: Q = n * A_metal / L_eff * int(k dT)
+    # int(k dT) for 304/316 stainless 20 K -> 293 K ~ 3000 W/m (NIST).
+    kint_SS = 3000          # [W/m]
+    #        name                               n   OD[mm]  wall[mm]  L_eff[m]
+    PEN = [('GH2 vent 1 in (1.5 + hose 5)',     1,  25.4,   1.65,    0.50),
+           ('LH2 fill 1/4 in (1.6 + 2.14.5)',   1,   6.35,  0.89,    0.50),
+           ('dP line GH2 1/4 in (1.7 + 9)',     1,   6.35,  0.89,    0.50),
+           ('dP line LH2 1/4 in (1.8 + 8)',     1,   6.35,  0.89,    0.50),
+           ('Purge He/N2 1/4 in (6)',           1,   6.35,  0.89,    0.50),
+           ('Purge H2 3/8 in (7)',              1,   9.53,  0.89,    0.50),
+           ('Temperature sensor tubes (1.9)',   2,   6.35,  0.89,    0.30)]   # <-- CHECK size
+    Q_supports = 1.0        # 2 support blocks + mounting rail, material/size unknown [W]  <-- PLACEHOLDER
+    Q_wires = 0.1           # sensor wiring through Sub-D [W]
+    n_sightglass = 0        # DN63 sight glasses looking at the inner tank (removed -> 0)
+    use_spec_boiloff = True # True = heat leak from the boil-off SPEC below, False = from the drawing
+    boiloff_spec_gph = 11   # specified boil-off rate [g/h]
+    p_spec_g = 1.2e5        # pressure at which the spec is given [Pa g] -> ~1.36 W
+    Q_leak_override = NAN   # set e.g. 2.5 [W] to force any value (NaN = off)
+    Q_sweep = np.array([0.5, 1, 1.4, 2, 3.4, 5, 10, 22])  # heat leaks [W] (Fig 9)
+
+    # ---- Gas supply from SVE container (R&I Gasversorgung) ----
+    p_bundle = 300e5                         # bundle pressure [Pa g] (info only)
+    p_line_g = {'H2': 18e5, 'He': 18e5, 'N2': 10e5}   # supply line pressures [Pa g]
+    Q_reg = {'H2': 627, 'He': 446, 'N2': 130}         # regulator max capacity [Nm3/h]
+    Q_line_max = 120                         # design flow of each DN15 supply line [Nm3/h]
+    p_SiV_g = 25e5                           # line safety valves (info only)
+    PN_line, PN_vent = 25e5, 40e5            # pipe ratings (info only)
+    ops_gas = 'He'                           # gas for the leak-test pressurisation ('He' or 'N2')
+    Cv_QC = {'He': 0.2, 'N2': 0.2, 'H2': 0.5}  # quick couplings QC4 / QC6
+    d_feed, Cd_feed = 2e-3, 0.80             # (reference only)
+    h_wall = 0                               # gas-wall heat transfer [W/m2K]; 0 = adiabatic worst case
+    fail_use_restriction = True              # regulator-failure inflow limited by the coupling Cv
+
+    # ---- LH2 filling through the DN8 bayonet and 1/4" line
+    dp_fill = 0.3e5
+    L_fill = 6.0            # total length of transfer line + 1/4" fill line assumed [m]
+    ID_fill = 4.57e-3       # bore of the 1/4" tube (0.035" wall) [m]
+    K_fill = 5              # bayonet, bends, entry/exit losses [-]
+
+    # ---- Boil-off line: 1" tube -> boil-off valve -> check valve -> vent header ----
+    d_vent = 22.1e-3        # bore of the 1" tube / boil-off valve [m]   <-- valve datasheet
+    Cd_vent = 0.60          # discharge coefficient of line + valve + check valve  <-- estimate
+    VH = {'dp40': 0.370e5, 'Q40': 1860,      # DN40: 370 mbar at 1860 Nm3/h (R&I)
+          'dp80': 0.120e5, 'Q80': 4650,      # DN80: 120 mbar at 4650 Nm3/h (R&I)
+          'rho_ref': 0.0899}                 # reference gas density [kg/Nm3] (H2)
+
+    # ---- Safety valves & chimney ----
+    d_SV, Kd_SV = 8e-3, 0.80  # each safety valve: flow diameter / coefficient  <-- datasheet
+    q_LOV = 6e3             # loss-of-vacuum heat flux with MLI [W/m2] (38e3 bare)
+    T_stack_exit = 100      # vented H2 temperature at chimney exit [K]
+
+    # ---- Measured data (unified logger EU-CSV: ';' separator, ',' decimal) ----
+    data_file = ''          # e.g. r'C:\TACOMA\logs\run.csv'
+    col_time = 'timestamp'
+    col_p = 'p_tank'
+    p_unit = 1e5            # bar -> Pa
+    p_is_gauge = True       # JUMO relative transmitter
+    col_T_liq = 'T_sensor_1'
+    col_T_vap = 'T_sensor_2'
+    col_dp = 'dp_level'     # JUMO dTRANS p20 DELTA level signal
+    dp_unit = 100           # mbar -> Pa
+    make_demo_log = True    # no real log yet
+    m_fill_meas = NAN       # LH2 mass actually filled [kg] (NaN = model value)
+    win_lockup_h = [NAN, NAN]
+    win_boiloff_h = [NAN, NAN]
+    win_leak_h = [NAN, NAN]
+    t_fill_h = 0
+
+    # ---- Constants ----
+    N2 = {'g': 1.40, 'R': 296.8}
+    N2['cv'] = N2['R'] / (N2['g'] - 1);  N2['cp'] = N2['g'] * N2['cv']
+    N2_hfg, N2_Tsat, N2_rhoL, N2_cpg = 199.2e3, 77.36, 806.1, 1040
+    H2_g, H2_R, H2_cpg, He_R = 1.40, 4124.2, 10.4e3, 2077.1
+    GAS = {'H2': {'g': 1.405, 'R': 4124.2, 'rho_n': 0.0899},
+           'He': {'g': 1.667, 'R': 2077.1, 'rho_n': 0.1786},
+           'N2': {'g': 1.400, 'R': 296.8, 'rho_n': 1.2506}}
+    for gn, Gx in GAS.items():
+        Gx['cv'] = Gx['R'] / (Gx['g'] - 1);  Gx['cp'] = Gx['g'] * Gx['cv']
+        Gx['p_line'] = p_line_g[gn] + patm
+        Gx['md_line'] = Q_line_max * Gx['rho_n'] / 3600
+        Gx['md_reg'] = Q_reg[gn] * Gx['rho_n'] / 3600
+    A_v = math.pi / 4 * d_vent**2;  A_SV = math.pi / 4 * d_SV**2
+    CdA_QC = lambda gn: Cv_QC[gn] * 1.699e-5   # effective Cd*A of the coupling for gas gn [m^2]
+    sigma = 5.670e-8
+
+    # %% 1) GEOMETRY, STEEL MASS, LEVEL-VOLUME CURVE ========================
+    Ri = Ro - t_wall;  h_head = head_k * Ri
+    V_cyl = math.pi * Ri**2 * L_cyl;  V_head = (2 / 3) * math.pi * Ri**2 * h_head
+    V = V_cyl + 2 * V_head                                   # internal volume [m3]
+    a = Ro;  c = head_k * Ro
+    if abs(c - a) < 1e-9:
+        A_head = 2 * math.pi * a**2
+    else:
+        e = math.sqrt(1 - c**2 / a**2)
+        A_head = math.pi * a**2 + math.pi * c**2 / (2 * e) * math.log((1 + e) / (1 - e))
+    A_out = 2 * math.pi * Ro * L_cyl + 2 * A_head            # outer surface inner vessel [m2]
+    m_steel = rho_ss * A_out * t_wall + m_extra              # steel that must be chilled [kg]
+
+    hgt = np.linspace(0, 2 * Ri, 400)
+    A_seg = Ri**2 * np.arccos((Ri - hgt) / Ri) - (Ri - hgt) * np.sqrt(np.maximum(2 * Ri * hgt - hgt**2, 0))
+    fracV_of_h = (L_cyl * A_seg + (4 / 3) * math.pi * Ri**2 * h_head * (hgt**2 * (3 * Ri - hgt)) / (4 * Ri**3)) / V
+
+    print('=== 1) GEOMETRY ===')
+    print(f'Ri {1e3*Ri:.1f} mm | head depth {1e3*h_head:.1f} mm | V = {1e3*V:.1f} L (cyl {1e3*V_cyl:.1f} + 2 x {1e3*V_head:.1f}) '
+          f'| area {A_out:.2f} m2 | steel ~{m_steel:.0f} kg\n')
+
+    # %% 2) LH2 SATURATION TABLE ============================================
+    # para-H2 saturated: p[bar a] T[K] rhoL rhoV [kg/m3] uL uV hL hV [kJ/kg]
+    TAB = np.array([
+        [1.00, 20.227, 70.879, 1.3228, -1.85, 370.22, -0.44, 445.82],
+        [1.25, 21.001, 69.975, 1.6193, 5.70, 372.65, 7.48, 449.84],
+        [1.50, 21.671, 69.157, 1.9129, 12.50, 374.46, 14.67, 452.87],
+        [1.75, 22.265, 68.402, 2.2051, 18.76, 375.83, 21.32, 455.19],
+        [2.00, 22.802, 67.693, 2.4967, 24.61, 376.85, 27.56, 456.96],
+        [2.25, 23.293, 67.021, 2.7885, 30.12, 377.61, 33.48, 458.30],
+        [2.50, 23.747, 66.379, 3.0810, 35.37, 378.14, 39.13, 459.28],
+        [2.75, 24.169, 65.760, 3.3749, 40.39, 378.48, 44.57, 459.96],
+        [3.00, 24.566, 65.162, 3.6704, 45.22, 378.65, 49.82, 460.39],
+        [3.25, 24.940, 64.580, 3.9679, 49.89, 378.69, 54.92, 460.60],
+        [3.50, 25.294, 64.013, 4.2679, 54.42, 378.59, 59.89, 460.60],
+        [3.75, 25.631, 63.456, 4.5706, 58.84, 378.38, 64.75, 460.43],
+        [4.00, 25.952, 62.910, 4.8764, 63.15, 378.07, 69.51, 460.10],
+        [4.25, 26.260, 62.371, 5.1855, 67.37, 377.65, 74.18, 459.61],
+        [4.50, 26.555, 61.839, 5.4984, 71.51, 377.15, 78.78, 458.99],
+        [4.75, 26.839, 61.313, 5.8152, 75.58, 376.55, 83.33, 458.23],
+        [5.00, 27.112, 60.790, 6.1364, 79.59, 375.87, 87.81, 457.35],
+        [5.25, 27.376, 60.271, 6.4623, 83.55, 375.11, 92.26, 456.35],
+        [5.50, 27.632, 59.754, 6.7932, 87.46, 374.28, 96.66, 455.24],
+        [5.75, 27.879, 59.237, 7.1295, 91.33, 373.36, 101.04, 454.01],
+        [6.00, 28.119, 58.721, 7.4717, 95.18, 372.37, 105.39, 452.67],
+        [6.25, 28.352, 58.205, 7.8201, 98.99, 371.30, 109.73, 451.22],
+        [6.50, 28.579, 57.687, 8.1753, 102.79, 370.15, 114.06, 449.66],
+        [6.75, 28.799, 57.166, 8.5377, 106.57, 368.93, 118.38, 447.99],
+        [7.00, 29.014, 56.642, 8.9080, 110.34, 367.63, 122.70, 446.21],
+        [7.25, 29.224, 56.113, 9.2868, 114.11, 366.25, 127.03, 444.32],
+        [7.50, 29.428, 55.580, 9.6747, 117.88, 364.78, 131.38, 442.31],
+        [7.75, 29.628, 55.040, 10.0726, 121.66, 363.23, 135.74, 440.17],
+        [8.00, 29.823, 54.492, 10.4814, 125.46, 361.59, 140.14, 437.92],
+        [8.25, 30.014, 53.936, 10.9020, 129.27, 359.85, 144.56, 435.53],
+        [8.50, 30.200, 53.369, 11.3357, 133.11, 358.02, 149.04, 433.00],
+        [8.75, 30.383, 52.791, 11.7838, 136.99, 356.07, 153.56, 430.33],
+        [9.00, 30.562, 52.199, 12.2479, 140.91, 354.01, 158.15, 427.49],
+        [9.25, 30.738, 51.592, 12.7298, 144.88, 351.82, 162.81, 424.48],
+        [9.50, 30.910, 50.966, 13.2318, 148.92, 349.49, 167.56, 421.29],
+        [9.75, 31.079, 50.320, 13.7565, 153.04, 347.01, 172.41, 417.89],
+        [10.00, 31.244, 49.649, 14.3072, 157.25, 344.36, 177.39, 414.26],
+        [10.25, 31.407, 48.950, 14.8880, 161.58, 341.51, 182.52, 410.36],
+        [10.50, 31.566, 48.216, 15.5041, 166.05, 338.44, 187.82, 406.16],
+        [10.75, 31.723, 47.441, 16.1622, 170.69, 335.11, 193.35, 401.62],
+        [11.00, 31.877, 46.616, 16.8714, 175.54, 331.46, 199.14, 396.66],
+        [11.25, 32.028, 45.727, 17.6443, 180.67, 327.42, 205.27, 391.18],
+        [11.50, 32.177, 44.756, 18.4991, 186.15, 322.91, 211.85, 385.07],
+        [11.75, 32.323, 43.675, 19.4639, 192.13, 317.74, 219.03, 378.11],
+        [12.00, 32.466, 42.435, 20.5858, 198.81, 311.68, 227.09, 369.98]])
+    S = {'p': TAB[:, 0] * 1e5, 'T': TAB[:, 1], 'rl': TAB[:, 2], 'rv': TAB[:, 3],
+         'ul': TAB[:, 4] * 1e3, 'uv': TAB[:, 5] * 1e3, 'hl': TAB[:, 6] * 1e3, 'hv': TAB[:, 7] * 1e3}
+
+    def sat(f, p):                       # sat('T', 5e5) = T_sat at 5 bar a
+        r = interp1(S['p'], S[f], p)
+        return float(r) if np.ndim(r) == 0 else r
+
+    p_fill = patm                                         # filling with the boil-off valve open -> ~1 atm
+    p_bov = p_bov_open_g + patm;  p_bovc = p_bov_close_g + patm
+    p_MEOP = MEOP_g + patm;  p_rel = 1.1 * MEOP_g + patm  # safety valve set / max relieving pressure
+    p_test = p_leaktest_g + patm                          # warm He leak test (boil-off valve closed)
+    Gc = {'g': 1.40, 'R': 4124.2, 'rho_n': 0.0899}        # cold GH2 for vent calculations
+
+    # %% 3) PRESSURE LEVELS & BURST (structural) ============================
+    Di = 2 * Ri;  De = 2 * Ro
+    pb_thin = Rm * t_wall / Ri
+    pb_faupel = (2 / math.sqrt(3)) * Rp02 * (2 - Rp02 / Rm) * math.log(Ro / Ri)
+    pb_head = 2 * Rm * t_wall / (Di + 0.2 * t_wall)
+    p_burst_g = min(pb_thin, pb_faupel, pb_head)
+    f_allow = min(Rp02 / 1.5, Rm / 2.4)
+    PS_shell_g = min(2 * f_allow * z_weld * t_wall / (De - t_wall), 2 * f_allow * z_weld * t_wall / (Di + 0.2 * t_wall))
+    PS_g = min(PS_shell_g, PS_comp_g)
+    PT_g = 1.43 * PS_g                                    # PED hydrostatic test pressure
+    E_gas = lambda p: p * V / (N2['g'] - 1) * (1 - (patm / p)**((N2['g'] - 1) / N2['g']))
+
+    print('=== 3) PRESSURE LEVELS [bar g] ===')
+    print(f'Boil-off valve {p_bov_close_g/1e5:.1f}/{p_bov_open_g/1e5:.1f} | alarm {p_alarm_g/1e5:.2f} | He leak test {p_leaktest_g/1e5:.2f} '
+          f'| MEOP = tank SVs {MEOP_g/1e5:.2f} | SV +10% {1.1*MEOP_g/1e5:.2f} | line SVs {p_lineSV_g/1e5:.2f} | PS {PS_g/1e5:.2f} '
+          f'| hydro {PT_g/1e5:.2f} | burst {p_burst_g/1e5:.0f}')
+    chk(p_bov_open_g <= 0.9 * MEOP_g, 'operating pressure <= 90 % of tank safety-valve set (valves stay tight)')
+    chk(p_leaktest_g <= 0.9 * MEOP_g, 'He leak test pressure <= 90 % of tank safety-valve set')
+    chk(p_bov_open_g < p_alarm_g < MEOP_g, 'alarm between operating pressure and MEOP')
+    chk(p_lineSV_g <= PS_comp_g, 'line safety valves below the line/component rating')
+    if has_SV:
+        chk(1.1 * MEOP_g <= PS_g, 'safety valve +10 % <= system allowable PS')
+    else:
+        print('  [WARN] no safety valves / burst disc: nothing limits pressure if the vent is blocked (see 8c and 11)')
+    chk(PT_g < p_burst_g, 'hydro test pressure < burst')
+    chk(p_burst_g / MEOP_g >= SF_req, f'burst factor >= {SF_req:.1f} (is {p_burst_g/MEOP_g:.0f})')
+    print(f'Stored gas energy: {E_gas(p_test)/1e3:.0f} kJ at leak test, {E_gas(p_MEOP)/1e3:.0f} kJ at MEOP -> proof/burst tests with WATER\n')
+    plt.figure(1, figsize=(9, 5)); plt.clf()
+    lv1 = np.array([p_bov_close_g, p_bov_open_g, p_alarm_g, MEOP_g, 1.1 * MEOP_g, p_lineSV_g, PS_g, PT_g]) / 1e5
+    l4, l5 = ('MEOP / tank safety valves', 'SV +10%') if has_SV else ('MEOP (no valve here!)', '1.1 x MEOP')
+    plt.barh(range(1, 9), lv1)
+    plt.yticks(range(1, 9), ['Boil-off valve closes', 'Boil-off valve opens (= leak test)', 'Alarm', l4, l5,
+                             'Line safety valves', 'PS system', 'Hydro test'])
+    plt.xlabel('pressure [bar g]'); plt.grid(True); plt.xlim(0, 1.2 * lv1.max())
+    for k in range(8):
+        plt.text(lv1[k], k + 1, f'  {lv1[k]:.2f}', va='center')
+    plt.title(f'Fig 1 - pressure levels of the tank (shell burst {p_burst_g/1e5:.0f} bar g, off scale)')
+    plt.tight_layout()
+
+    # %% 4) PHASE A - He PURGE + LEAK-CHECK LIMITS ==========================
+    Gp = GAS['He']
+    md_He = min(orifice(CdA_QC('He'), Gp['p_line'], T_room, patm, Gp['g'], Gp['R']), Gp['md_line'])
+    N_O2 = math.log(0.21 / c_target_O2);  N_N2 = math.log(1 / c_target_N2)
+    m_sw = lambda N: N * patm * V / (Gp['R'] * T_room)     # He mass for N volumes at ~1 atm
+    r = p_vent_low / p_purge_high
+    n_O2 = purge_cycles(0.21, c_target_O2, r);  n_N2 = purge_cycles(1.0, c_target_N2, r)
+    Q_min_p = 10 * V * dp_res / t_hold                      # mbar*L/s
+    Q_min_T = 10 * V * (p_hold * dT_res / T_room) / t_hold
+    print(f'=== 4) PHASE A: He PURGE ({purge_mode}) ===')
+    print(f'Sweep purge (boil-off valve open): O2 < {1e6*c_target_O2:.0f} ppm after {N_O2:.1f} tank volumes = '
+          f'{1e3*m_sw(N_O2):.0f} g He, {m_sw(N_O2)/md_He/60:.1f} min at {1e3*md_He:.1f} g/s')
+    print(f'Sweep purge after LN2 drain: N2 < {1e6*c_target_N2:.0f} ppm after {N_N2:.1f} volumes = '
+          f'{1e3*m_sw(N_N2):.0f} g He, {m_sw(N_N2)/md_He/60:.1f} min')
+    print(f'Pressure purge alternative (boil-off valve cycled, {(p_purge_high-patm)/1e5:.0f} bar g): {n_O2} cycles for O2, {n_N2} for N2')
+    print('Sweep needs He inlet and vent outlet far apart; dead legs (sensor ports, dTRANS lines) purge worse -> O2 analyser at the vent')
+    print(f'Leak test (boil-off valve closed, {p_leaktest_g/1e5:.0f} bar g): pressure hold sees leaks > {Q_min_p:.2f} mbar*L/s '
+          f'(resolution) / {Q_min_T:.2f} ({dT_res:.1f} K drift) -> He sniffer below\n')
+    plt.figure(2); plt.clf()
+    Nv = np.linspace(0, max(N_O2, N_N2) + 1, 200)
+    plt.semilogy(Nv, 0.21 * np.exp(-Nv) * 1e6, lw=1.5, label='O$_2$ (air in tank)')
+    plt.semilogy(Nv, 1.0 * np.exp(-Nv) * 1e6, '--', lw=1.5, label='N$_2$ (after LN$_2$ drain)')
+    plt.plot(Nv[[0, -1]], 1e6 * c_target_O2 * np.ones(2), 'r:', label='O$_2$ target')
+    plt.plot(Nv[[0, -1]], 1e6 * c_target_N2 * np.ones(2), 'k:', label='N$_2$ target')
+    plt.grid(True, which='both'); plt.xlabel('tank volumes of He flushed through'); plt.ylabel('impurity [ppm]')
+    plt.legend(); plt.title('Fig 2 - He sweep purge through the tank (boil-off valve open)')
+
+    # %% 5) PHASE B/C/D - CHILLDOWN =========================================
+    TT = np.array([20, 30, 40, 50, 60, 77, 100, 125, 150, 175, 200, 250, 293.15])
+    cp = np.array([12, 27, 58, 98, 136, 195, 255, 305, 345, 375, 400, 440, 475])   # 304/316 SS approx [J/kgK]
+    Hcum = cumtrapz(TT, cp)
+    H_ss = lambda T: np.interp(T, TT, Hcum)
+    hfg_H2 = sat('hv', p_fill) - sat('hl', p_fill)
+    dH_B = m_steel * (H_ss(T_room) - H_ss(N2_Tsat))
+    dH_D = m_steel * (H_ss(N2_Tsat) - H_ss(20.3))
+    dH_X = m_steel * (H_ss(T_room) - H_ss(20.3))
+    mLN2 = dH_B / np.array([N2_hfg, N2_hfg + N2_cpg * (T_room - N2_Tsat)])     # [worst best]
+    mLH2 = dH_D / np.array([hfg_H2, hfg_H2 + H2_cpg * (N2_Tsat - 20.3)])
+    mLH2x = dH_X / np.array([hfg_H2, hfg_H2 + H2_cpg * (T_room - 20.3)])
+    print(f'=== 5) CHILLDOWN (steel {m_steel:.0f} kg) ===')
+    print(f'B  LN2 293->77 K : {dH_B/1e6:.2f} MJ -> {mLN2[1]:.1f}-{mLN2[0]:.1f} kg LN2')
+    print(f'C  after LN2 drain: He sweep of {N_N2:.1f} tank volumes to N2 < {1e6*c_target_N2:.0f} ppm (section 4)')
+    print(f'D  LH2 77->20 K  : {dH_D/1e6:.2f} MJ -> {mLH2[1]:.2f}-{mLH2[0]:.2f} kg LH2 '
+          f'(without LN2 pre-cool: {mLH2x[1]:.1f}-{mLH2x[0]:.1f} kg)\n')
+    plt.figure(3, figsize=(11, 4.5)); plt.clf()
+    plt.subplot(1, 2, 1); Tp = np.linspace(20.3, T_room, 200)
+    plt.plot(Tp, m_steel * H_ss(Tp) / 1e6, lw=1.5)
+    plt.plot([N2_Tsat, N2_Tsat], [0, m_steel * H_ss(T_room) / 1e6], 'k--'); plt.grid(True)
+    plt.xlabel('steel temperature [K]'); plt.ylabel('heat to remove [MJ]'); plt.title('Fig 3a - heat stored in the steel')
+    plt.subplot(1, 2, 2)
+    bars = np.vstack([mLN2, mLH2, mLH2x]); xb = np.arange(3); w = 0.38
+    plt.bar(xb - w / 2, bars[:, 0], w, label='worst (latent only)')
+    plt.bar(xb + w / 2, bars[:, 1], w, label='best (cold gas used)')
+    plt.xticks(xb, ['LN2 293-77', 'LH2 77-20', 'LH2 293-20']); plt.ylabel('cryogen [kg]'); plt.grid(True)
+    plt.legend(); plt.title('Fig 3b - cryogen needed'); plt.tight_layout()
+
+    # %% 6) PHASE D - LH2 CAPACITY + FILL HEIGHT ============================
+    rho_max = fill_max_at_relief * sat('rl', p_rel) + (1 - fill_max_at_relief) * sat('rv', p_rel)
+    rho_lim = rho_max
+    if math.isnan(fill_target):
+        rho0 = rho_max
+    else:
+        rho0 = fill_target * sat('rl', p_fill) + (1 - fill_target) * sat('rv', p_fill)
+        if rho0 > rho_max:
+            print('WARNING: fill_target above safety limit -> limited'); rho0 = rho_max
+    m0 = rho0 * V
+    if not math.isnan(m_fill_meas):
+        m0 = m_fill_meas; rho0 = m0 / V
+    f_lim = liq_frac(rho_lim, p_fill, sat)
+    fill_frac = liq_frac(rho0, p_fill, sat)
+    h_fill = float(np.interp(fill_frac, fracV_of_h, hgt))
+    print('=== 6) LH2 CAPACITY ===')
+    print(f"100 % liquid would be {sat('rl', p_fill)*V:.2f} kg (not allowed); safety limit {100*f_lim:.1f} % = {rho_lim*V:.2f} kg")
+    print(f'Planned fill {m0:.2f} kg = {100*fill_frac:.1f} % liquid ({1e3*fill_frac*V:.1f} L) + {1e3*(1-fill_frac)*V:.1f} L gas space '
+          f'| liquid height {1e3*h_fill:.0f} of {2e3*Ri:.0f} mm')
+    print(f"Liquid expands {100*(sat('rl', p_fill)/sat('rl', p_rel) - 1):.1f} % between 1 atm and safety-valve relieving pressure")
+    g0 = 9.81
+    dp_LH2 = (sat('rl', p_fill) - sat('rv', p_fill)) * g0 * h_fill
+    dp_LN2 = (N2_rhoL - 4.6) * g0 * h_fill
+    print(f'dTRANS level signal at this fill: LH2 {dp_LH2/100:.2f} mbar | LN2 {dp_LN2/100:.1f} mbar (same height) -> check dTRANS range/accuracy!\n')
+    plt.figure(4); plt.clf()
+    plt.plot(100 * fracV_of_h, 1e3 * hgt, lw=1.5, label='horizontal tank')
+    plt.plot(100 * fill_frac, 1e3 * h_fill, 'ro', mfc='r', label='planned fill')
+    plt.plot(100 * f_lim, 1e3 * np.interp(f_lim, fracV_of_h, hgt), 'ks', mfc='k', label='safety limit')
+    plt.grid(True); plt.xlabel('liquid volume [%]'); plt.ylabel('liquid height from bottom [mm]')
+    plt.legend(loc='upper left'); plt.title('Fig 4 - fill level: volume vs liquid height')
+
+    # %% 7) HEAT LEAK - BUILT UP FROM THE DRAWING ===========================
+    eps_eff = 1 / (1 / eps_in + 1 / eps_out - 1)
+    Q_rad = sigma * eps_eff * A_out * (T_room**4 - 20.3**4)          # bare vacuum gap
+    Q_ins = q_MLI * A_out if use_MLI else Q_rad
+    Q_pen = np.array([n * kint_SS * math.pi * (OD / 1e3 - wl / 1e3) * (wl / 1e3) / L for (_, n, OD, wl, L) in PEN])
+    Q_sg = n_sightglass * math.pi / 4 * 0.063**2 * sigma * T_room**4 * eps_in
+    Q_cond = Q_pen.sum() + Q_supports + Q_wires + Q_sg
+    Q_leak = Q_ins + Q_cond
+    Q_est = Q_leak                                                   # estimate from the drawing
+    p_spec = p_spec_g + patm
+    Q_spec = boiloff_spec_gph / 3.6e6 * (sat('hv', p_spec) - sat('hl', p_spec)) / (1 - sat('rv', p_spec) / sat('rl', p_spec))
+    if use_spec_boiloff:
+        Q_leak = Q_spec
+    if not math.isnan(Q_leak_override):
+        Q_leak = Q_leak_override
+    print('=== 7) HEAT LEAK FROM THE DRAWING ===')
+    print(f"   {'path':<34s} {'Q [W]':>7s}")
+    print(f"   {ternary(use_MLI, 'MLI blanket', 'bare vacuum radiation'):<34s} {Q_ins:7.2f}  "
+          f"({ternary(use_MLI, f'{q_MLI:.1f} W/m2', 'no MLI')})")
+    for k, row in enumerate(PEN):
+        print(f'   {row[0]:<34s} {Q_pen[k]:7.2f}')
+    print(f"   {'supports (placeholder)':<34s} {Q_supports:7.2f}\n   {'sensor wires':<34s} {Q_wires:7.2f}\n   {'sight glasses':<34s} {Q_sg:7.2f}")
+    print(f"   {'TOTAL from drawing':<34s} {Q_est:7.2f} W   (without MLI it would be {Q_rad + Q_cond:.1f} W)")
+    print(f'-> Heat leak: drawing estimate {Q_est:.2f} W | spec {boiloff_spec_gph:.0f} g/h at {p_spec_g/1e5:.1f} bar g = {Q_spec:.2f} W | USED {Q_leak:.2f} W\n')
+    plt.figure(10, figsize=(9, 5)); plt.clf()
+    qb = np.concatenate([[Q_ins], Q_pen, [Q_supports, Q_wires]])
+    nb = [ternary(use_MLI, 'MLI', 'radiation (bare)')] + [p[0] for p in PEN] + ['supports', 'wires']
+    plt.barh(range(1, len(qb) + 1), qb); plt.yticks(range(1, len(qb) + 1), nb); plt.grid(True); plt.xlabel('heat leak [W]')
+    plt.title(f'Fig 10 - drawing estimate {Q_est:.1f} W (model uses {Q_leak:.2f} W)'); plt.tight_layout()
+
+    # LH2 fill time through the 1/4" line (single-phase liquid = FASTEST possible)
+    A_fl = math.pi / 4 * ID_fill**2;  rhoL = sat('rl', p_fill);  f_D = 0.02
+    v_fl = math.sqrt(2 * dp_fill / (rhoL * (f_D * L_fill / ID_fill + K_fill)))
+    md_fl = rhoL * A_fl * v_fl
+    print(f'LH2 fill through 1/4" line at {dp_fill/1e5:.2f} bar dp: <= {1e3*md_fl:.1f} g/s -> {m0:.2f} kg in >= '
+          f'{m0/md_fl/60:.0f} min (two-phase flow: expect 2-5x longer)\n')
+
+    # %% 8) BOIL-OFF CONTROLLED BY THE BOIL-OFF VALVE =======================
+    # 8a) Model check against the HYDROS 250 datasheet
+    Vh, mh = 0.266, 13.7;  rh = mh / Vh;  p12 = 1.2e5 + patm;  p6 = 6e5 + patm
+    Qh = 0.011 / 3600 * (sat('hv', p12) - sat('hl', p12)) / (1 - sat('rv', p12) / sat('rl', p12))
+    th8 = mh * (u_mix(rh, p6, sat) - u_mix(rh, p12, sat)) / Qh
+    k_strat = th8 / 3600 / 32                              # real pressure rise is this much faster
+    r202 = 0.202 / Vh * sat('rl', p_fill) + (1 - 0.202 / Vh) * sat('rv', p_fill)
+    print('=== 8a) HYDROS 250 CHECK ===')
+    print(f'Fill rule: 202 L of 266 L -> {100*liq_frac(r202, p6, sat):.1f} % liquid at 6 bar g (our rule 95 %) -> confirmed')
+    print(f'Heat leak from 11 g/h: {Qh:.2f} W | closed-tank pressure rise: model {th8/3600:.0f} h vs datasheet 32 h -> real is {k_strat:.1f}x faster\n')
+
+    # 8b) Normal operation: lock-up, then boil-off valve cycles between p_bov_open and p_bov_close
+    #   closed: U = U + Q dt        open: U = U + Q dt - mdot h_v dt, m = m - mdot dt
+    A_BOV = Cd_vent * A_v
+    m = m0;  U = m0 * u_mix(rho0, p_fill, sat)
+    t = 0.0;  is_open = False;  n_open = 0;  vented = 0.0;  istep = 0;  t_lock = NAN
+    dt_closed, dt_open = 30.0, 2e-3
+    N = 2_000_000
+    tv, pv, lv, mv = [0.0], [p_fill], [fill_frac], [0.0]
+    while t < 30 * 86400 and len(tv) < N:
+        rho = m / V
+        p = p_from_rho_u(rho, U / m, S)
+        if math.isnan(p):
+            print('state left table range - stop'); break
+        lf = liq_frac(rho, p, sat)
+        if lf < 0.02:
+            break
+        if not is_open and p >= p_bov:
+            is_open = True;  n_open += 1
+            if math.isnan(t_lock):
+                t_lock = t
+        elif is_open and p <= p_bovc:
+            is_open = False
+        if is_open:
+            dt = dt_open;  md = vent_flow(A_BOV, p, sat('T', p), Gc, VH, patm, dp_crack)
+        else:
+            dt = dt_closed;  md = 0.0
+        U = U + Q_leak * dt - md * sat('hv', p) * dt
+        m = m - md * dt;  vented += md * dt;  t += dt;  istep += 1
+        if not is_open or istep % 50 == 0:
+            tv.append(t); pv.append(p); lv.append(lf); mv.append(vented)
+    tv, pv, lv, mv = map(np.array, (tv, pv, lv, mv));  t_empty = t
+    t_cycle = (t_empty - t_lock) / max(n_open, 1)
+    hfg_op = sat('hv', p_bov) - sat('hl', p_bov)
+    md_bo = Q_leak / hfg_op * (1 - sat('rv', p_bov) / sat('rl', p_bov))
+    print(f"=== 8b) BOIL-OFF via {ternary(vent_type == 'relief', 'SPRING RELIEF VALVE (self-acting)', 'ACTUATED BOIL-OFF VALVE')} "
+          f"(opens {p_bov_open_g/1e5:.1f} / closes {p_bov_close_g/1e5:.1f} bar g, check valve {dp_crack/100:.0f} mbar) ===")
+    if p_bov_open_g > 0.9 * MEOP_g:
+        print(f'  [WARN] boil-off opens at {p_bov_open_g/1e5:.1f} bar g = too close to the tank SVs ({MEOP_g/1e5:.1f}): the SVs become the working valve')
+    print(f'Lock-up 1 atm -> {p_bov_open_g/1e5:.1f} bar g: {t_lock/3600:.1f} h model (~{t_lock/3600/k_strat:.1f} h realistic)')
+    print(f'Boil-off valve opens {n_open} times, about every {t_cycle/3600:.1f} h | average boil-off {3.6e6*md_bo:.0f} g/h '
+          f'| LH2 gone after {t_empty/86400:.1f} days')
+    print(f"LH2 stored at {sat('T', p_bov):.1f} K (saturation at {p_bov_open_g/1e5:.1f} bar g)\n")
+
+    # 8c) Boil-off valve STUCK CLOSED (or line iced): closed tank from operating pressure
+    u_op = u_mix(rho0, p_bov, sat)
+    t_alarm = m0 * (u_mix(rho0, p_alarm_g + patm, sat) - u_op) / Q_leak
+    t_MEOPc = m0 * (u_mix(rho0, p_MEOP, sat) - u_op) / Q_leak
+    p_PS = min(PS_g + patm, S['p'][-1])
+    t_PSc = m0 * (u_mix(rho0, p_PS, sat) - u_op) / Q_leak
+    print(f'=== 8c) BOIL-OFF VALVE STUCK CLOSED at {Q_leak:.1f} W ===')
+    print(f'Alarm ({p_alarm_g/1e5:.1f} bar g): {t_alarm/3600:.1f} h model / ~{t_alarm/3600/k_strat:.1f} h realistic '
+          f'| safety valves ({MEOP_g/1e5:.1f} bar g): {t_MEOPc/3600:.1f} h / ~{t_MEOPc/3600/k_strat:.1f} h')
+    if has_SV:
+        print(f'-> the {n_SV} tank safety valves open at MEOP and vent to the header (sized in section 11)')
+    else:
+        print(f'-> NO safety valves: tank limit PS reached after {t_PSc/3600:.1f} h / ~{t_PSc/3600/k_strat:.1f} h unless someone opens a vent')
+    print(f'Liquid at MEOP: {100*liq_frac(rho0, p_MEOP, sat):.0f} % of the tank (limit {100*fill_max_at_relief:.0f} %)\n')
+
+    plt.figure(5, figsize=(10, 8)); plt.clf()
+    ax = plt.subplot(3, 1, 1); th_ = tv / 3600
+    plt.plot(th_, (pv - patm) / 1e5, lw=1.0, label='tank')
+    plt.plot(th_[[0, -1]], p_bov_open_g / 1e5 * np.ones(2), 'm--', label='boil-off valve opens')
+    plt.plot(th_[[0, -1]], p_alarm_g / 1e5 * np.ones(2), 'k:', label='alarm')
+    plt.plot(th_[[0, -1]], MEOP_g / 1e5 * np.ones(2), 'r--', label='tank safety valves')
+    plt.ylim(0, 1.1 * MEOP_g / 1e5); plt.ylabel('p [bar g]'); plt.grid(True); plt.legend(loc='upper left')
+    plt.title('Fig 5 - lock-up, then the boil-off valve holds the operating pressure')
+    plt.subplot(3, 1, 2, sharex=ax); plt.plot(th_, 100 * lv, lw=1.2); plt.grid(True); plt.ylabel('liquid [%]')
+    plt.subplot(3, 1, 3, sharex=ax); plt.plot(th_, mv, lw=1.2); plt.grid(True); plt.ylabel('GH2 vented [kg]'); plt.xlabel('t [h]')
+    plt.tight_layout()
+
+    plt.figure(9); plt.clf()
+    plt.loglog(Q_sweep, t_lock * Q_leak / Q_sweep / 3600, 'o-', lw=1.5, label='lock-up to operating pressure')
+    plt.loglog(Q_sweep, t_empty * Q_leak / Q_sweep / 3600, 's-', lw=1.5, label='LH2 gone')
+    plt.loglog(Q_sweep, t_cycle * Q_leak / Q_sweep / 3600, '^-', lw=1.5, label='time between valve openings')
+    plt.loglog(Q_sweep, t_MEOPc * Q_leak / Q_sweep / 3600 / k_strat, 'd--', lw=1.5, label='valve stuck: to MEOP (realistic)')
+    plt.grid(True, which='both'); plt.xlabel('heat leak Q [W]'); plt.ylabel('time [h]'); plt.legend()
+    plt.title('Fig 9 - all times scale with 1/heat leak')
+
+    # %% 9) DEPRESSURISATION: power failure (actuated, fail-open) or manual vent (relief)
+    mf = m0;  Uf = m0 * u_op;  pf = p_bov;  dt = 1e-3
+    tfl, pfl9 = [0.0], [p_bov]
+    p_end = patm + dp_crack + 200
+    while pf > p_end and len(tfl) < 1e6:
+        md = vent_flow(A_BOV, pf, sat('T', pf), Gc, VH, patm, dp_crack)
+        if md <= 0:
+            break
+        Uf = Uf - sat('hv', pf) * md * dt;  mf = mf - md * dt
+        pf = p_from_rho_u(mf / V, Uf / mf, S)
+        if math.isnan(pf):
+            break
+        tfl.append(tfl[-1] + dt);  pfl9.append(pf)
+    tfl, pfl9 = np.array(tfl), np.array(pfl9)
+    m_flash = m0 - mf
+    print(f"=== 9) DEPRESSURISATION to ~1 atm from {p_bov_open_g/1e5:.1f} bar g "
+          f"({ternary(vent_type == 'relief', 'operator opens the manual vent valve - spring valves need no power', 'power failure: boil-off valve fails open')}) ===")
+    print(f"Tank vents to ~1 atm in {tfl[-1]:.1f} s | {m_flash:.2f} kg flashes off ({100*m_flash/m0:.0f} %) "
+          f"| liquid cools {sat('T', p_bov):.1f} K -> {sat('T', pf):.1f} K")
+    print('-> safe state (tank at ~1 atm, vent open), but plan for this mass going up the chimney at once\n')
+    plt.figure(11); plt.clf()
+    plt.plot(tfl, (pfl9 - patm) / 1e5, lw=1.5); plt.grid(True); plt.xlabel('t [s]'); plt.ylabel('p [bar g]')
+    plt.title(f'Fig 11 - venting the tank to 1 atm: {100*m_flash/m0:.0f} % of the LH2 flashes')
+
+    # %% 10) He LEAK TEST ON THE WARM TANK: PRESSURISATION + BLOWDOWN ======
+    # Tank energy (open system):  m cv dT/dt = mdot_in (cp T_in - cv T) - mdot_out R T + Q
+    G = GAS[ops_gas];  dt = 0.02
+    mt = patm * V / (G['R'] * T_room);  Tt = T_room
+    tp, pt_, Tp_ = [0.0], [patm], [Tt]
+    while tp[-1] < 3600:
+        md = min(orifice(CdA_QC(ops_gas), min(p_test, G['p_line']), T_room, pt_[-1], G['g'], G['R']), G['md_line'])
+        Tt = Tt + dt * (md * (G['cp'] * T_room - G['cv'] * Tt) + h_wall * A_out * (T_room - Tt)) / (mt * G['cv'])
+        mt = mt + dt * md
+        tp.append(tp[-1] + dt);  pt_.append(mt * G['R'] * Tt / V);  Tp_.append(Tt)
+        if pt_[-1] >= 0.99 * p_test + 0.01 * patm:
+            break
+    tp, pt_, Tp_ = np.array(tp), np.array(pt_), np.array(Tp_)
+    dt = 0.002;  T = Tt;  mg = mt
+    tb, pb = [0.0], [pt_[-1]]
+    while pb[-1] > patm + dp_crack + 500 and len(tb) < 1e6:
+        md = vent_flow(Cd_vent * A_v, pb[-1], T, G, VH, patm, dp_crack)
+        T = T + dt * (-md * G['R'] * T + h_wall * A_out * (T_room - T)) / (mg * G['cv'])
+        mg = mg - dt * md
+        tb.append(tb[-1] + dt);  pb.append(mg * G['R'] * T / V)
+    print(f'=== 10) {ops_gas} LEAK TEST (warm tank, boil-off valve closed) ===')
+    print(f'Pressurise 0 -> {p_leaktest_g/1e5:.0f} bar g via quick coupling (Cv {Cv_QC[ops_gas]:.1f}): {tp[-1]:.0f} s, '
+          f'gas heats to {Tp_.max():.0f} K (no heat exchange)')
+    print(f'Cooling back to room T: pressure falls to ~{(pt_[-1]*T_room/Tp_[-1] - patm)/1e5:.2f} bar g WITHOUT any leak '
+          f'-> wait for stable T, compare p/T')
+    print(f'Boil-off valve opened: blowdown through valve + check valve in {tb[-1]:.1f} s\n')
+    plt.figure(6); plt.clf()
+    plt.subplot(2, 1, 1); plt.plot(tp, (pt_ - patm) / 1e5, lw=1.5); plt.grid(True); plt.ylabel('p [bar g]')
+    plt.title(f'Fig 6 - {ops_gas} leak test: filling to {p_leaktest_g/1e5:.0f} bar g (boil-off valve closed)')
+    plt.subplot(2, 1, 2); plt.plot(tp, Tp_, lw=1.5); plt.grid(True); plt.ylabel('T$_{gas}$ [K]'); plt.xlabel('t [s]')
+    plt.tight_layout()
+
+    # %% 11) BOIL-OFF PATH CAPACITY + TANK SAFETY VALVES (no burst disc) ====
+    # Cases: (a) loss of insulating vacuum with LH2 inside (cold GH2)
+    #        (b) tank-panel regulator fails open: SVE regulator max flow into the tank
+    print('=== 11) BOIL-OFF PATH + TANK SAFETY VALVES ===')
+    p_line_max = max(p_line_g.values())
+    chk(p_line_max <= PS_g, f'supply line pressure ({p_line_max/1e5:.0f} bar g) <= tank PS ({PS_g/1e5:.1f} bar g)')
+    print('   -> if FAIL: panel pressure reducer + safety valves sized for full regulator flow are mandatory')
+    hfgR = sat('hv', p_rel) - sat('hl', p_rel)
+    md_LOV = q_LOV * A_out / hfgR * (1 - sat('rv', p_rel) / sat('rl', p_rel))
+    cases = [('(a) loss of vacuum, cold GH2', md_LOV, sat('T', p_rel), Gc)]
+    for gn in ('H2', 'He', 'N2'):
+        Gg = GAS[gn];  md_in = Gg['md_reg']
+        if fail_use_restriction:
+            md_in = min(md_in, orifice(CdA_QC(gn), Gg['p_line'], T_room, p_rel, Gg['g'], Gg['R']))
+        cases.append((f'(b) regulator open, {gn}', md_in, T_room, Gg))
+    A_case = np.zeros(len(cases));  p_open = np.zeros(len(cases))
+    print('   case                              flow [g/s]  [Nm3/h]  valve open: tank p [bar g]  valve shut: SV d [mm]')
+    for k, (name, md, Tu, Gk) in enumerate(cases):
+        p_open[k] = p_needed(md, Tu, Gk, Cd_vent * A_v, VH, patm, dp_crack)
+        pbk = p_back(md, Gk['rho_n'], VH, patm)
+        A_case[k] = md / (Kd_SV * orifice(1, p_rel, Tu, pbk, Gk['g'], Gk['R']))
+        print(f"   {name:<33s} {1e3*md:9.1f} {md/Gk['rho_n']*3600:8.0f} {(p_open[k]-patm)/1e5:20.2f} {1e3*math.sqrt(4*A_case[k]/math.pi):20.1f}")
+    kgov = int(np.argmax(A_case));  A_req = A_case[kgov];  d_SV_req = math.sqrt(4 * A_req / math.pi)
+    chk(p_open.max() - patm < MEOP_g, 'open boil-off path alone keeps every case below MEOP')
+    if has_SV:
+        print(f'Each of the {n_SV} tank safety valves needs flow diameter >= {1e3*d_SV_req:.1f} mm (boil-off path shut, '
+              f'governed by {cases[kgov][0]}); installed {1e3*d_SV:.1f} mm -> {okstr(d_SV >= d_SV_req)}')
+    else:
+        print(f'[WARN] NO tank safety valves: if the boil-off path is shut nothing relieves pressure. '
+              f'A relief device would need >= {1e3*d_SV_req:.1f} mm ({cases[kgov][0]})')
+    rho_air = patm / (287 * T_room);  rho_cold = sat('rv', patm);  rho_exit = patm / (H2_R * T_stack_exit)
+    print(f'Chimney: fresh GH2 {rho_cold:.2f} kg/m3 vs air {rho_air:.2f} -> heavier than air until it warms; '
+          f'at {T_stack_exit:.0f} K exit {rho_exit:.3f} kg/m3')
+    print('Check valves on every line into the shared header stop backflow and air from reaching the cold tank')
+    print('Vacuum jacket: an inner-tank leak pressurises the flat-walled box - the lid resting on its FKM seal acts as its relief; keep it free to lift')
+    # Failure simulation: boil-off path SHUT + panel regulator fails open (governing gas), one tank safety valve.
+    kb = int(np.argmax(A_case[1:]));  gname, md_in, _, Gf = cases[kb + 1]
+    A_SVuse = has_SV * max(A_SV, A_req)
+    mt = p_bov * V / (Gf['R'] * T_room);  Tt = T_room;  dt = 1e-3;  sv_open = False
+    tf, pfl = [0.0], [p_bov]
+    while tf[-1] < 30:
+        pk = mt * Gf['R'] * Tt / V
+        if pk >= p_MEOP:
+            sv_open = True
+        if sv_open and pk < 0.9 * MEOP_g + patm:
+            sv_open = False
+        mo = vent_flow(Kd_SV * A_SVuse, pk, Tt, Gf, VH, patm) if sv_open else 0.0
+        mi = md_in * (pk < Gf['p_line'])                    # inflow stops at supply line pressure
+        Tt = Tt + dt * (mi * (Gf['cp'] * T_room - Gf['cv'] * Tt) - mo * Gf['R'] * Tt + h_wall * A_out * (T_room - Tt)) / (mt * Gf['cv'])
+        mt = mt + dt * (mi - mo)
+        tf.append(tf[-1] + dt);  pfl.append(mt * Gf['R'] * Tt / V)
+    tf, pfl = np.array(tf), np.array(pfl)
+    i_PS = np.nonzero(pfl - patm > PS_g)[0]
+    if i_PS.size == 0:
+        print(f'Boil-off path shut + {gname}: peak {(pfl.max()-patm)/1e5:.2f} bar g (limit {1.1*MEOP_g/1e5:.2f}, PS {PS_g/1e5:.2f}) -> OK\n')
+    else:
+        print(f'Boil-off path shut + {gname}, no relief: PS ({PS_g/1e5:.1f} bar g) exceeded after {tf[i_PS[0]]:.1f} s, '
+              f'tank heads to the supply line pressure -> NOT OK\n')
+    plt.figure(7); plt.clf()
+    plt.plot(tf, (pfl - patm) / 1e5, lw=1.5, label='tank')
+    plt.plot(tf[[0, -1]], MEOP_g / 1e5 * np.ones(2), 'r--', lw=1.2, label='MEOP = safety valve set')
+    plt.plot(tf[[0, -1]], PS_g / 1e5 * np.ones(2), 'k--', lw=1.2, label='PS (tank limit)')
+    plt.ylim(0, 1.15 * max(PS_g, pfl.max() - patm) / 1e5); plt.grid(True); plt.xlabel('t [s]'); plt.ylabel('p [bar g]')
+    plt.legend(loc='lower right')
+    if has_SV:
+        plt.title(f"Fig 7 - boil-off path SHUT and {gname.replace('(b) ', '')}: one tank safety valve d = {1e3*math.sqrt(4*A_SVuse/math.pi):.1f} mm")
+    else:
+        plt.title(f"Fig 7 - boil-off path SHUT and {gname.replace('(b) ', '')}: NO relief valve")
+
+    # %% 11b) TRAPPED LINE SECTION: WHY EVERY CLOSABLE SECTION NEEDS A SAFETY VALVE
+    # Para-H2 isochores (NIST/CoolProp) starting from saturated liquid at 1 atm:
+    #        T[K]   p liquid-full   p 90 % liquid   p 50 % liquid   [bar a]
+    ISO = np.array([[20.3, 1.26, 1.02, 1.02],
+                    [21.0, 7.21, 1.25, 1.25],
+                    [22.0, 15.72, 1.63, 1.63],
+                    [23.0, 24.23, 2.10, 2.10],
+                    [24.0, 32.73, 2.65, 2.65],
+                    [25.0, 41.23, 3.29, 3.29],
+                    [26.0, 49.73, 7.91, 4.04],
+                    [28.0, 66.70, 21.84, 5.87],
+                    [30.0, 83.64, 35.76, 8.23],
+                    [32.0, 100.53, 49.64, 11.20],
+                    [35.0, 125.77, 70.37, 17.59],
+                    [40.0, 167.54, 104.66, 29.48],
+                    [50.0, 249.76, 172.20, 53.93],
+                    [80.0, 485.49, 366.60, 127.22],
+                    [150.0, 986.79, 783.41, 292.16],
+                    [293.0, 1892.88, 1544.81, 609.99]])
+    print(f'=== 11b) TRAPPED LH2 IN A CLOSED LINE SECTION (line safety valve {p_lineSV_g/1e5:.1f} bar g) ===')
+    lbl = ['liquid-full', '90 % liquid', '50 % liquid']
+    for cidx in range(1, 4):
+        Tsv = float(interp1(ISO[:, cidx], ISO[:, 0], p_lineSV_g / 1e5 + 1.013))
+        print(f'   {lbl[cidx-1]:<12s}: line safety valve opens after warming only {Tsv - 20.3:.1f} K; '
+              f'at room temperature it would reach {ISO[-1, cidx]:.0f} bar')
+    print('-> every section that can be closed at both ends needs its own safety valve (or must never be closed cold)\n')
+    plt.figure(12); plt.clf()
+    for cidx in range(1, 4):
+        plt.semilogy(ISO[:, 0], ISO[:, cidx] - 1.013, lw=1.5, label=lbl[cidx - 1])
+    plt.plot(ISO[[0, -1], 0], p_lineSV_g / 1e5 * np.ones(2), 'r--', lw=1.2, label='line safety valve')
+    plt.grid(True, which='both'); plt.xlabel('temperature of the trapped hydrogen [K]'); plt.ylabel('pressure [bar g]')
+    plt.ylim(0.5, 3000); plt.legend(loc='lower right'); plt.title('Fig 12 - LH2 trapped between two closed valves warms up')
+
+    # %% 12) MEASURED DATA vs MODEL =========================================
+    #  (1) lock-up window (valve closed): pressure rise  -> Q = m * du / dt
+    #  (2) boil-off window (valve cycling): level drop from dTRANS -> Q = -(dm_liquid/dt) * h_fg
+    # If no real log exists yet and make_demo_log = True, a SYNTHETIC log is written
+    # (heat leak x1.5, sensor noise). DEMO DATA IS NOT A MEASUREMENT.
+    is_demo = False
+    if (not data_file or not os.path.exists(data_file)) and make_demo_log:
+        is_demo = True;  data_file = os.path.join(tempfile.gettempdir(), 'tacoma_DEMO_log.csv')
+        Qd = 1.5;  t_dem = min(96 * 3600, 0.95 * t_empty / Qd);  rng = np.random.default_rng(1)
+        td = np.arange(0, t_dem + 1e-9, 60.0)
+        sel = tv / Qd <= t_dem + 3600
+        pd_ = np.interp(td, tv[sel] / Qd, pv[sel])
+        ld = np.interp(td, tv[sel] / Qd, lv[sel])
+        hd = np.interp(np.clip(ld, 0, 1), fracV_of_h, hgt)
+        pdc = np.clip(pd_, S['p'][0], S['p'][-1])
+        dpd = (sat('rl', pdc) - sat('rv', pdc)) * 9.81 * hd
+        n_ = td.size
+        col = np.column_stack([1.79e12 + 1000 * td, (pd_ - patm) / 1e5 + 0.002 * rng.standard_normal(n_),
+                               sat('T', pdc) - 0.2 + 0.05 * rng.standard_normal(n_),
+                               sat('T', pdc) + 2 + 0.2 * rng.standard_normal(n_),
+                               dpd / 100 + 0.02 * rng.standard_normal(n_)])
+        with open(data_file, 'w') as fid:
+            fid.write(f'{col_time};{col_p};{col_T_liq};{col_T_vap};{col_dp}\n')
+            for row in col:
+                fid.write(f'{row[0]:.0f};{row[1]:.5f};{row[2]:.4f};{row[3]:.4f};{row[4]:.4f}'.replace('.', ',') + '\n')
+        win_lockup_h = [2, 0.8 * t_lock / Qd / 3600]
+        win_boiloff_h = [t_lock / Qd / 3600 + 2, 0.9 * t_dem / 3600];  t_fill_h = 0
+    if data_file and os.path.exists(data_file):
+        D = read_eu_csv(data_file)
+        print(f"=== 12) {ternary(is_demo, 'DEMO (synthetic)', 'MEASURED')} DATA: {D[fn(col_time)].size} rows ===")
+        print('Columns: ' + ' | '.join(D.keys()))
+        ts = D[fn(col_time)];  th = (ts - ts[0]) / 1000 / 3600
+        pm = D[fn(col_p)] * p_unit + p_is_gauge * patm
+        TL = D[fn(col_T_liq)];  TV = D[fn(col_T_vap)]
+        pm_in = np.clip(pm, S['p'][0], S['p'][-1])
+        tag = ' [DEMO DATA]' if is_demo else ''
+        plt.figure(8, figsize=(10, 8)); plt.clf()
+        plt.subplot(3, 1, 1)
+        plt.plot(th, (pm - patm) / 1e5, lw=1.0, label='measured')
+        plt.plot(tv / 3600 + t_fill_h, (pv - patm) / 1e5, '--', lw=1.0, label='model')
+        plt.xlim(0, th.max()); plt.grid(True); plt.ylabel('p [bar g]'); plt.legend(loc='lower right')
+        plt.title('Fig 8a - tank pressure: measured vs model' + tag)
+        plt.subplot(3, 1, 2)
+        plt.plot(th, TL, lw=1.2, label='T liquid sensor'); plt.plot(th, TV, lw=1.2, label='T vapour sensor')
+        plt.plot(th, sat('T', pm_in), 'k--', lw=1.2, label='T$_{sat}$(p measured)')
+        plt.xlim(0, th.max()); plt.ylim(15, 40); plt.grid(True); plt.ylabel('T [K]'); plt.legend(loc='lower right')
+        plt.title('Fig 8b - sensors vs boiling temperature' + tag)
+        if not any(math.isnan(x) for x in win_lockup_h):
+            i1 = int(np.argmax(th >= win_lockup_h[0]));  i2 = int(np.argmax(th >= win_lockup_h[1]))
+            Q1 = m0 * (u_mix(rho0, pm_in[i2], sat) - u_mix(rho0, pm_in[i1], sat)) / ((th[i2] - th[i1]) * 3600)
+            print(f'Heat leak from lock-up pressure rise {win_lockup_h[0]:.0f}-{win_lockup_h[1]:.0f} h: {Q1:.2f} W '
+                  f'(model {Q_leak:.2f} W, ratio {Q1/Q_leak:.2f})')
+        if fn(col_dp) in D:
+            dpm = D[fn(col_dp)] * dp_unit
+            hm = dpm / ((sat('rl', pm_in) - sat('rv', pm_in)) * 9.81)
+            lvm = np.interp(np.clip(hm, 0, 2 * Ri), hgt, fracV_of_h)
+            plt.subplot(3, 1, 3)
+            plt.plot(th, 100 * lvm, lw=1.2, label='from dTRANS'); plt.plot(tv / 3600 + t_fill_h, 100 * lv, '--', lw=1.2, label='model')
+            plt.xlim(0, th.max()); plt.grid(True); plt.ylabel('liquid [%]'); plt.xlabel('t [h]'); plt.legend(loc='upper right')
+            plt.title('Fig 8c - liquid level from dTRANS vs model' + tag)
+            if not any(math.isnan(x) for x in win_boiloff_h):
+                w_ = (th >= win_boiloff_h[0]) & (th <= win_boiloff_h[1])
+                mLm = lvm[w_] * V * sat('rl', pm_in[w_])
+                c1 = np.polyfit(th[w_] * 3600, mLm, 1)
+                pmean = float(np.mean(pm_in[w_]))
+                Q2 = -c1[0] * (sat('hv', pmean) - sat('hl', pmean))
+                print(f'Heat leak from level drop {win_boiloff_h[0]:.0f}-{win_boiloff_h[1]:.0f} h: {Q2:.2f} W '
+                      f'(model {Q_leak:.2f} W, ratio {Q2/Q_leak:.2f})')
+        plt.tight_layout()
+        print('  -> put the measured value in Q_leak_override and rerun: all predictions are then calibrated')
+        if not any(math.isnan(x) for x in win_leak_h):
+            i1 = int(np.argmax(th >= win_leak_h[0]));  i2 = int(np.argmax(th >= win_leak_h[1]))
+            dts = (th[i2] - th[i1]) * 3600
+            print(f'He hold leak: raw {10*V*(pm[i1]-pm[i2])/dts:.3f}, T-compensated '
+                  f'{10*V*(pm[i1]/TV[i1] - pm[i2]/TV[i2])*T_room/dts:.3f} mbar*L/s (detection limit ~{max(Q_min_p, Q_min_T):.2f})')
+        print()
+    else:
+        print('=== 12) No measured data file set (data_file) - skipped ===\n')
+
+    # %% 13) SUMMARY =========================================================
+    print('=== 13) SUMMARY ===')
+    print(f"V {1e3*V:.1f} L | boil-off valve {p_bov_open_g/1e5:.1f}/{p_bov_close_g/1e5:.1f} bar g + check valve | tank safety valves: "
+          f"{ternary(has_SV, f'{n_SV} at {MEOP_g/1e5:.0f} bar g', 'NONE')} | line SVs {p_lineSV_g/1e5:.1f} bar g | burst {p_burst_g/1e5:.0f} bar g")
+    print(f'He sweep purge {1e3*m_sw(N_O2):.0f} + {1e3*m_sw(N_N2):.0f} g | LN2 {mLN2[1]:.0f}-{mLN2[0]:.0f} kg | '
+          f'LH2 chill {mLH2[1]:.2f}-{mLH2[0]:.2f} kg | fill {m0:.2f} kg ({100*fill_frac:.0f} %)')
+    print(f'At {Q_leak:.1f} W: lock-up {t_lock/3600:.0f} h, valve opens every {t_cycle/3600:.1f} h, LH2 gone after {t_empty/86400:.1f} days '
+          f'| valve stuck: MEOP ~{t_MEOPc/3600/k_strat:.1f} h (realistic)')
+    print(f'Venting to 1 atm: {100*m_flash/m0:.0f} % flash loss | each tank SV d >= {1e3*d_SV_req:.1f} mm')
+
+    plt.show()
+
+
+if __name__ == '__main__':
+    main()
