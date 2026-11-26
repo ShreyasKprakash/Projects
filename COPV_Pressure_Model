@@ -1,5 +1,4 @@
 
-%
 %  STEPS / FIGURES
 %   1-2  Geometry, LH2 property table
 %   3    Pressure levels & burst                              -> Fig 1
@@ -19,7 +18,7 @@ clear; close all; clc;
 
 %% 0) INPUTS ===============================================================
 
-Ro       = 0.2032;     
+Ro     = 381.68e-3/2 + 9.5e-3;     
 L_cyl    = 0.7919;     
 t_wall   = 9.5e-3;     
 head_k   = 0.465;        
